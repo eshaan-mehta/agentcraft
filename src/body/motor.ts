@@ -67,6 +67,34 @@ export async function pause(ms: number, signal?: Signal) {
   }
 }
 
+/** Waits for a sleeping bot to wake up (morning, or something attacked); false if it's still asleep after `ms`. */
+export function wokeWithin(bot: Bot, ms: number, signal: Signal): Promise<boolean> {
+  if (!bot.isSleeping) return Promise.resolve(true);
+  return new Promise((resolve, reject) => {
+    const finish = (woke: boolean | null) => {
+      clearTimeout(timer);
+      bot.off("wake", onWake);
+      signal?.removeEventListener("abort", onAbort);
+      if (woke === null) reject(abortError(signal!));
+      else resolve(woke);
+    };
+    // The new time of day arrives up to a second after the wake-up; wait for it, so
+    // whoever checks the time next doesn't see the night that just ended.
+    const onWake = () => {
+      clearTimeout(timer);
+      const fallback = setTimeout(() => finish(true), 1_500);
+      bot.once("time", () => {
+        clearTimeout(fallback);
+        finish(true);
+      });
+    };
+    const onAbort = () => finish(null);
+    const timer = setTimeout(() => finish(false), ms);
+    bot.once("wake", onWake);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /**
  * Asks the server to resend the inventory. Mineflayer leaves the last click of some
  * window operations unconfirmed (2x2 crafting, container moves), so its model of the
@@ -646,7 +674,17 @@ export class Motor {
     } catch (err) {
       throw new ActionError("FAILED", `Couldn't sleep: ${errorText(err)}`);
     }
-    return `Sleeping in the bed at ${formatPos(bed.position)}; respawn point set there. You'll wake at sunrise, or if something attacks.`;
+    const where = formatPos(bed.position);
+    // The night skips about 5s after every player in the world is in bed.
+    if (await wokeWithin(this.bot, 15_000, signal)) {
+      return `Slept in the bed at ${where} (respawn point set there). The night passed; it's ${this.bot.time.timeOfDay < 12_000 ? "morning" : "still night: something woke you"}.`;
+    }
+    const awake = Object.values(this.bot.players)
+      .filter((p) => p.username !== this.bot.username && p.gamemode !== 3) // spectators don't count
+      .map((p) => p.username);
+    return `In bed at ${where} (respawn point set there), but the night isn't passing: it only skips once every player is asleep${
+      awake.length ? `, and ${awake.join(", ")} ${awake.length > 1 ? "are" : "is"} up` : ""
+    }. Waiting won't make it pass sooner. Stay in bed (you'll wake at sunrise or if attacked), ask the others to sleep too, or get up and do something else.`;
   }
 
   async wake() {

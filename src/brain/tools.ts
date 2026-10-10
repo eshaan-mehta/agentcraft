@@ -4,7 +4,7 @@ import type { Bot } from "mineflayer";
 import vm from "node:vm";
 import { z } from "zod";
 import { apiReference, type Method } from "../api.js";
-import { pause } from "../body/motor.js";
+import { pause, wokeWithin } from "../body/motor.js";
 import { config, team } from "../config.js";
 import { ActionError } from "../errors.js";
 import { log } from "../log.js";
@@ -394,7 +394,8 @@ export function createTools({ bot, api, knowledge, memory, skills, executive }: 
     }),
     tool({
       name: "sleep_in_bed",
-      description: "Sleep in the nearest bed within 32 blocks (at night). Sets your respawn point.",
+      description:
+        "Sleep in the nearest bed within 32 blocks (at night or in a thunderstorm), and set your respawn point there. Returns once the night has passed, which happens about 5s after every player in the world is in bed; if others are still up, it says who after 15s.",
       input: z.object({}),
       body: true,
       run: (_args, signal) => call("sleep", [], signal),
@@ -411,10 +412,17 @@ export function createTools({ bot, api, knowledge, memory, skills, executive }: 
     }),
     tool({
       name: "wait",
-      description: "Wait for something to happen (crops to grow, a furnace, daylight).",
+      description: "Wait for something to happen (crops to grow, a furnace, daylight). Ends early if you're asleep and wake up.",
       input: z.object({ seconds: z.number().min(1).max(120) }),
       run: async ({ seconds }, signal) => {
-        await pause(seconds * 1000, signal);
+        const started = Date.now();
+        if (bot.isSleeping) {
+          if (await wokeWithin(bot, seconds * 1000, signal)) {
+            return `Woke up after ${Math.round((Date.now() - started) / 1000)}s. ${see.statusLine(bot)}`;
+          }
+        } else {
+          await pause(seconds * 1000, signal);
+        }
         return `Waited ${seconds}s. ${see.statusLine(bot)}`;
       },
     }),

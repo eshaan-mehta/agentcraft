@@ -1,0 +1,7 @@
+node_modules/
+.env
+logs/
+server/
+agents.json
+data/
+runtime/

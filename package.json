@@ -1,0 +1,29 @@
+{
+  "name": "agentcraft",
+  "version": "1.0.0",
+  "description": "A Claude-powered Minecraft player you can delegate tasks to",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "server:setup": "tsx scripts/setup-server.ts",
+    "server": "tsx scripts/start-server.ts",
+    "typecheck": "tsc -p .",
+    "usage": "tsx scripts/usage.ts",
+    "agents": "tsx scripts/agents.ts",
+    "dashboard": "tsx scripts/dashboard.ts"
+  },
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
+    "mineflayer": "^4.39.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "vec3": "^0.1.10",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "private": true
+}

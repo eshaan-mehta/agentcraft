@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agentcraft dashboard</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a href="#/" class="brand">agentcraft <span>dashboard</span></a>
+    <span id="connection" class="connection">connecting…</span>
+  </header>
+
+  <main>
+    <!-- Home: global spend and a card per agent -->
+    <section id="home" hidden>
+      <div class="totals">
+        <div class="stat hero">
+          <div class="label">Spent, all time</div>
+          <div class="value" id="cost-all">–</div>
+        </div>
+        <div class="stat hero">
+          <div class="label">Spent today</div>
+          <div class="value" id="cost-today">–</div>
+          <div class="sub" id="today-date"></div>
+        </div>
+        <div class="stat">
+          <div class="label">Input tokens</div>
+          <div class="value" id="tok-in">–</div>
+          <div class="sub" id="tok-cached"></div>
+        </div>
+        <div class="stat">
+          <div class="label">Output tokens</div>
+          <div class="value" id="tok-out">–</div>
+          <div class="sub" id="tok-out-today"></div>
+        </div>
+        <div class="stat">
+          <div class="label">Requests</div>
+          <div class="value" id="tok-req">–</div>
+          <div class="sub" id="tok-req-today"></div>
+        </div>
+      </div>
+      <h2 class="section-title">Agents <span id="agent-count" class="muted"></span></h2>
+      <div id="cards" class="cards"></div>
+      <p id="no-agents" class="empty" hidden>No agents yet. Start one with <code>npm start</code> or several with <code>npm run agents</code>.</p>
+    </section>
+
+    <!-- One agent: status and costs, the chat, and what it's thinking and doing -->
+    <section id="agent" hidden>
+      <div class="agent-head">
+        <div class="agent-title">
+          <a href="#/" class="back">← All agents</a>
+          <h1><span id="a-dot" class="dot"></span><span id="a-name"></span></h1>
+          <span id="a-team" class="badge" hidden></span>
+          <span id="a-state" class="state"></span>
+          <span id="a-meta" class="muted"></span>
+        </div>
+        <div class="agent-stats">
+          <div class="stat small"><div class="label" id="a-session-label">This session</div><div class="value" id="a-cost-session">–</div></div>
+          <div class="stat small"><div class="label">Today</div><div class="value" id="a-cost-today">–</div></div>
+          <div class="stat small"><div class="label">All time</div><div class="value" id="a-cost-all">–</div></div>
+          <div class="stat small"><div class="label">Requests</div><div class="value" id="a-requests">–</div></div>
+          <div class="stat small"><div class="label">Tokens in / out</div><div class="value" id="a-tokens">–</div></div>
+          <div class="stat small live-stat"><div class="label">In the world</div><div id="a-live" class="live"></div></div>
+        </div>
+        <div id="a-plan" class="plan-strip" hidden></div>
+      </div>
+
+      <div class="panes">
+        <div class="pane">
+          <div class="pane-head"><h2>Chat</h2></div>
+          <div id="asking-banner" class="banner" hidden>Waiting for your answer to its question. Reply below.</div>
+          <div id="chat-scroll" class="scroll">
+            <button type="button" class="older" data-older hidden>Load earlier history</button>
+            <div id="chat-log" class="log"></div>
+            <p id="chat-empty" class="empty" hidden>No messages yet.</p>
+          </div>
+          <button type="button" id="chat-jump" class="jump" hidden>New messages ↓</button>
+          <form id="chat-form" class="composer">
+            <textarea id="chat-input" rows="2" placeholder="Message the agent (Enter to send, Shift+Enter for a new line)"></textarea>
+            <div class="composer-actions">
+              <button type="submit" id="send">Send</button>
+              <button type="button" id="stop" class="danger" title="Halt it right away (/stop)">Stop</button>
+            </div>
+            <div id="chat-note" class="note"></div>
+          </form>
+        </div>
+
+        <div class="pane">
+          <div class="pane-head">
+            <h2>Activity</h2>
+            <div class="filters">
+              <label><input type="checkbox" data-kind="thinking" checked> Thinking</label>
+              <label><input type="checkbox" data-kind="tools" checked> Tools</label>
+              <label><input type="checkbox" data-kind="plan" checked> Plan</label>
+              <label><input type="checkbox" data-kind="events" checked> Events</label>
+              <label><input type="checkbox" data-kind="usage"> Usage</label>
+            </div>
+          </div>
+          <div id="feed-scroll" class="scroll">
+            <button type="button" class="older" data-older hidden>Load earlier history</button>
+            <div id="feed-log" class="log"></div>
+            <p id="feed-empty" class="empty" hidden>Nothing yet.</p>
+          </div>
+          <button type="button" id="feed-jump" class="jump" hidden>New activity ↓</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>Local only (127.0.0.1). Costs are estimates; your Anthropic Console has the exact billed amount.</footer>
+</body>
+</html>

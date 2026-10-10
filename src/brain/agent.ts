@@ -18,6 +18,7 @@ type ToolUse = Anthropic.Beta.BetaToolUseBlock;
 type ToolResult = Anthropic.Beta.BetaToolResultBlockParam;
 
 const STOP_WORDS = /^(stop|halt|cancel|freeze)\W*$/i;
+const NEW_MESSAGE = "Stopped partway because the supervisor sent a new message (below). Whatever this call already did still stands.";
 
 // Models that accept `fallbacks: "default"`, which re-runs a request on another
 // model server-side if the safety classifiers decline it.
@@ -93,6 +94,10 @@ export class Agent implements SurvivalHost, Executive {
   private pending: Pending[] = [];
   private systemNotes: string[] = [];
   private abort: AbortController | null = null;
+  /** The tool call in progress, so a new message can stop just that call. */
+  private currentCall: AbortController | null = null;
+  /** A supervisor message arrived mid-turn and Claude hasn't read it yet. */
+  private unread = false;
   private asking: ((from: string, answer: string) => void) | null = null;
   private idleSince = Date.now();
   private teammateWakes: number[] = [];
@@ -157,7 +162,10 @@ export class Agent implements SurvivalHost, Executive {
     }
     if (this.asking) return this.asking(from, text);
     this.pending.push({ text: `<${from}> ${to}${text}`, wake: true, fromSupervisor: true });
-    if (!this.busy) void this.run();
+    if (!this.busy) return void this.run();
+    // Mid-task: stop the current action so Claude reads this now, not when it's done.
+    this.unread = true;
+    this.currentCall?.abort(new Interrupted(NEW_MESSAGE));
   }
 
   /** A message a teammate sent with message_teammate. */
@@ -449,32 +457,43 @@ export class Agent implements SurvivalHost, Executive {
       let isError = true;
       if (signal.aborted) {
         output = "Not run: interrupted by the supervisor.";
+      } else if (this.unread) {
+        output = "Not run: the supervisor sent a new message (below) before this call started. Read it first.";
       } else if (cutOff) {
         const what = cutOff instanceof Died ? "you died during the call before this one" : "your survival reflexes interrupted the call before this one";
         output = `Not run: ${what}. Check your status and decide again.`;
       } else if (!tool) {
         output = `Unknown tool "${call.name}".`;
-      } else if (!tool.body) {
-        ({ output, isError } = await this.execute(tool, call, signal));
       } else {
-        // Waits here while a reflex has the body; a reflex arriving later preempts this lease.
-        let lease;
+        const stopCall = new AbortController();
+        this.currentCall = stopCall;
+        const callSignal = AbortSignal.any([signal, stopCall.signal]);
         try {
-          lease = await this.body.acquire(`task:${call.name}`, "task", signal);
-        } catch {
-          lease = null;
-        }
-        if (!lease) {
-          output = "Not run: interrupted by the supervisor.";
-        } else {
-          try {
-            if (this.bot.isSleeping && call.name !== "sleep_in_bed") await this.bot.wake().catch(() => {});
-            ({ output, isError } = await this.execute(tool, call, lease.signal));
-          } finally {
-            const reason: unknown = lease.signal.reason;
-            if (reason instanceof Preempted || reason instanceof Died) cutOff = reason;
-            lease.release();
+          if (!tool.body) {
+            ({ output, isError } = await this.execute(tool, call, callSignal));
+          } else {
+            // Waits here while a reflex has the body; a reflex arriving later preempts this lease.
+            let lease;
+            try {
+              lease = await this.body.acquire(`task:${call.name}`, "task", callSignal);
+            } catch {
+              lease = null;
+            }
+            if (!lease) {
+              output = `Not run: ${callSignal.reason instanceof Interrupted ? callSignal.reason.message : "interrupted by the supervisor."}`;
+            } else {
+              try {
+                if (this.bot.isSleeping && call.name !== "sleep_in_bed") await this.bot.wake().catch(() => {});
+                ({ output, isError } = await this.execute(tool, call, lease.signal));
+              } finally {
+                const reason: unknown = lease.signal.reason;
+                if (reason instanceof Preempted || reason instanceof Died) cutOff = reason;
+                lease.release();
+              }
+            }
           }
+        } finally {
+          this.currentCall = null;
         }
       }
       log.toolResult(call.name, output, isError, Date.now() - started);
@@ -501,6 +520,7 @@ export class Agent implements SurvivalHost, Executive {
   }
 
   private takePending(withHeader: boolean): { text: string; fromSupervisor: boolean } {
+    this.unread = false;
     const lines = this.pending.map((p) => p.text);
     const fromSupervisor = this.pending.some((p) => p.fromSupervisor);
     this.pending = [];

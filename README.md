@@ -46,7 +46,7 @@ The agent uses `ANTHROPIC_API_KEY` from `.env` if set, otherwise your Anthropic 
 
 ## Stepping in
 
-- **Talk to them** in game chat, an agent's terminal, or the dashboard. Say `stop` to halt one at once. Questions show up in chat; just reply.
+- **Talk to them** in game chat, an agent's terminal, or the dashboard. A message cuts into whatever the agent is doing, so it reads it right away and decides whether to switch tasks or carry on; `stop` halts it outright. Questions show up in chat; just reply.
 - **Cast more agents:** `npm run agents -- Claude:red Bob:red Eve` starts Claude and Bob as team "red" and Eve solo. Address one with `Bob, get wood`, a team with `@red build a wall`, or everyone with no name.
 - **Check spend:** `/usage` in an agent's terminal, or `npm run usage` for all sessions.
 

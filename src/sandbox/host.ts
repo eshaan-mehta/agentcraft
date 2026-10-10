@@ -44,6 +44,9 @@ export function runScript(code: string, args: unknown, options: RunOptions): Pro
     let stderr = "";
     child.stderr?.on("data", (chunk) => (stderr = (stderr + chunk).slice(-2000)));
 
+    // Stops api calls still running when the script ends early (time limit, interrupt).
+    const stop = new AbortController();
+    const signal = AbortSignal.any([options.signal, stop.signal]);
     let settled = false;
     // A result can come back after the script was stopped (an action finishing late
     // after a reflex took over). By then the process is gone, so drop it quietly.
@@ -53,6 +56,7 @@ export function runScript(code: string, args: unknown, options: RunOptions): Pro
     const finish = (result: Omit<ScriptResult, "logs" | "calls" | "seconds">) => {
       if (settled) return;
       settled = true;
+      stop.abort();
       clearTimeout(timer);
       options.signal.removeEventListener("abort", onAbort);
       child.kill("SIGKILL");
@@ -79,8 +83,8 @@ export function runScript(code: string, args: unknown, options: RunOptions): Pro
         const method = options.api[message.method ?? ""];
         const execute = async () => {
           if (!method) throw new ActionError("INVALID", `api.${message.method} doesn't exist. Check the API reference.`);
-          if (options.signal.aborted) throw abortError(options.signal);
-          return method.run(Array.isArray(message.args) ? message.args : [], options.signal);
+          if (signal.aborted) throw abortError(signal);
+          return method.run(Array.isArray(message.args) ? message.args : [], signal);
         };
         const pending = method?.body ? (bodyQueue = bodyQueue.catch(() => {}).then(execute)) : execute();
         pending.then(

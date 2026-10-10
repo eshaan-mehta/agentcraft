@@ -1,0 +1,7 @@
+{
+  "agents": [
+    { "name": "Claude", "team": "red" },
+    { "name": "Bob", "team": "red" },
+    { "name": "Eve", "team": null, "askMode": "rarely" }
+  ]
+}

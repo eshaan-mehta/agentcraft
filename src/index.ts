@@ -11,6 +11,7 @@ import { SessionStore } from "./brain/session.js";
 import { createTools } from "./brain/tools.js";
 import { say } from "./comms.js";
 import { ASK_MODES, config, team, type AskMode } from "./config.js";
+import { errorText } from "./errors.js";
 import { log } from "./log.js";
 import { startRuntime } from "./runtime.js";
 import { SkillLibrary } from "./skills/library.js";
@@ -21,6 +22,10 @@ import { formatPos } from "./world/perception.js";
 
 // Mineflayer plugins occasionally reject promises nobody awaits; log instead of crashing.
 process.on("unhandledRejection", (err) => log.error(`Unhandled error: ${String(err)}`, err));
+// Likewise for errors thrown in callbacks and unhandled 'error' events: one failing
+// piece shouldn't take the agent offline. (If the connection itself drops, the
+// "end" handler below exits, and the launcher restarts the agent.)
+process.on("uncaughtException", (err) => log.error(`Unexpected error, still running: ${errorText(err)}`, err));
 
 log.info(`Connecting to ${config.mc.host}:${config.mc.port} as ${config.mc.username} (Minecraft ${config.mc.version})...`);
 const { bot, movements } = await connect();

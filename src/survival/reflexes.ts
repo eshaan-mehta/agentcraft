@@ -478,9 +478,18 @@ export class Survival {
       return;
     }
 
+    // Running out of food stalls everything (no healing below 18 food), so keep a real supply.
+    const supply = foods(bot).reduce((sum, i) => sum + i.count, 0);
+    if (supply < 5 && t < 12000 && this.due("supply", 300_000)) {
+      this.host.alert(
+        `Your food supply is low (${supply} item${supply === 1 ? "" : "s"}). Restock before going on: aim for 20 or more. Cooked meat from animals, bread (3 wheat), fish (fish with a rod: 3 sticks + 2 string), sweet berries, apples from oak leaves, carrots, potatoes (bake them).`,
+      );
+      return;
+    }
+
     const missing = [
       !bestWeapon(bot) && "a weapon",
-      !foods(bot).length && "food",
+      supply < 10 && `a food supply (you have ${supply}; aim for 20+)`,
       shelterBlocks(bot).reduce((sum, i) => sum + i.count, 0) < 10 && "a stack of blocks like dirt or cobblestone for emergency shelters",
     ].filter(Boolean);
     if (missing.length && t < 11000 && this.host.idleMs() >= 60_000 && this.due("prepare", 600_000)) {

@@ -106,10 +106,10 @@ export class Agent implements SurvivalHost, Executive {
   private unread = false;
   /** The restored conversation stopped partway through a turn (a crash or dropped connection). */
   private interruptedTurn = false;
-  private asking: ((from: string, answer: string) => void) | null = null;
+  /** A question put to the supervisor that hasn't been answered yet. */
+  private openQuestion: string | null = null;
   private idleSince = Date.now();
   private teammateWakes: number[] = [];
-  private teammateWaiter: ((message: string) => void) | null = null;
   private currentPlan: { goal: string; steps: { step: string; status: string }[] } | null = null;
   private totals = { requests: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, cost: 0 };
 
@@ -135,17 +135,16 @@ export class Agent implements SurvivalHost, Executive {
     if (!config.resume) return "Starting a fresh conversation (RESUME_SESSION=off).";
     const saved = this.session.load();
     if (saved) {
+      // Calls to tools that have since been removed can stay in the history; tell Claude they're gone.
       const missing = [...toolsUsed(saved.messages)].filter((name) => !this.tools.has(name));
-      if (!missing.length) {
-        this.messages = closeOpenToolCalls(saved.messages);
-        // Unfinished: it ended on a tool call (now closed) or on input Claude never answered.
-        this.interruptedTurn = this.messages.at(-1)?.role !== "assistant";
-        this.dropStaleThinking = saved.fingerprint !== this.fingerprint;
-        return `Resumed the previous conversation (${saved.messages.length} messages, last saved ${saved.savedAt.slice(0, 16).replace("T", " ")} UTC)${
-          this.dropStaleThinking ? "; the code changed since then, so reasoning blocks from before won't be replayed" : ""
-        }.`;
-      }
-      log.warn(`The saved conversation used tools that no longer exist (${missing.join(", ")}), so it can't be resumed as is.`);
+      if (missing.length) this.systemNotes.push(`These tools no longer exist, so don't try to call them: ${missing.join(", ")}.`);
+      this.messages = closeOpenToolCalls(saved.messages);
+      // Unfinished: it ended on a tool call (now closed) or on input Claude never answered.
+      this.interruptedTurn = this.messages.at(-1)?.role !== "assistant";
+      this.dropStaleThinking = saved.fingerprint !== this.fingerprint;
+      return `Resumed the previous conversation (${saved.messages.length} messages, last saved ${saved.savedAt.slice(0, 16).replace("T", " ")} UTC)${
+        this.dropStaleThinking ? "; the code changed since then, so reasoning blocks from before won't be replayed" : ""
+      }.`;
     }
     this.briefing = briefingFromTranscripts(config.logDir, log.transcriptPath);
     return this.briefing
@@ -170,8 +169,9 @@ export class Agent implements SurvivalHost, Executive {
       this.pending.push({ text: `<${from}> ${to}${text} (you were halted immediately)`, wake: false, fromSupervisor: true });
       return;
     }
-    if (this.asking) return this.asking(from, text);
-    this.pending.push({ text: `<${from}> ${to}${text}`, wake: true, fromSupervisor: true });
+    const answering = this.openQuestion ? ` (after you asked: "${this.openQuestion}")` : "";
+    this.openQuestion = null;
+    this.pending.push({ text: `<${from}> ${to}${text}${answering}`, wake: true, fromSupervisor: true });
     if (!this.busy) return void this.run();
     // Mid-task: stop the current action so Claude reads this now, not when it's done.
     this.unread = true;
@@ -181,7 +181,6 @@ export class Agent implements SurvivalHost, Executive {
   /** A message a teammate sent with message_teammate. */
   receiveTeammate(from: string, text: string, expectsReply: boolean) {
     log.incoming(`${from} (teammate)`, text);
-    if (this.teammateWaiter) return this.teammateWaiter(`${from}${expectsReply ? " (wants a reply)" : ""}: ${text}`);
     // Requests wake the agent; FYIs wait for its next turn. The cap stops two agents
     // from talking each other into an expensive loop.
     const now = Date.now();
@@ -220,25 +219,13 @@ export class Agent implements SurvivalHost, Executive {
 
   // ---- Executive -------------------------------------------------------------------
 
-  ask(question: string, options: string[] | undefined, signal: AbortSignal): Promise<string> {
+  /** Puts a question to the supervisor without waiting: the answer interrupts whatever the agent is doing by then. */
+  ask(question: string, options: string[] | undefined): string {
     const text = options?.length ? `${question} Options: ${options.map((o, i) => `(${i + 1}) ${o}`).join(" ")}` : question;
     log.question(text);
     say(this.bot, `Question: ${text}`);
-    return new Promise((resolve) => {
-      const done = (answer: string) => {
-        clearTimeout(timer);
-        signal.removeEventListener("abort", onAbort);
-        this.asking = null;
-        resolve(answer);
-      };
-      const timer = setTimeout(
-        () => done(`No answer after ${config.askTimeoutMinutes} minutes. Use your best judgment and say what you assumed.`),
-        config.askTimeoutMinutes * 60_000,
-      );
-      const onAbort = () => done("The question was cancelled.");
-      signal.addEventListener("abort", onAbort, { once: true });
-      this.asking = (from, answer) => done(`${from} answered: ${answer}`);
-    });
+    this.openQuestion = question;
+    return "Asked. Don't wait for the answer: keep doing something useful that doesn't depend on it (food, materials, tools, scouting). The answer will interrupt you when it comes. If none comes, go with your best judgment.";
   }
 
   plan(goal: string, steps: { step: string; status: string }[], note?: string) {
@@ -254,31 +241,6 @@ export class Agent implements SurvivalHost, Executive {
 
   tell(text: string) {
     say(this.bot, text);
-  }
-
-  /** Waits for the next teammate message (or returns ones that already arrived). */
-  waitForTeammate(seconds: number, signal: AbortSignal): Promise<string> {
-    const waiting = this.pending.filter((p) => p.text.startsWith("[teammate "));
-    if (waiting.length) {
-      this.pending = this.pending.filter((p) => !waiting.includes(p));
-      return Promise.resolve(waiting.map((p) => p.text).join("\n"));
-    }
-    return new Promise((resolve) => {
-      const done = (message: string) => {
-        clearTimeout(timer);
-        signal.removeEventListener("abort", onAbort);
-        this.teammateWaiter = null;
-        resolve(message);
-      };
-      const timer = setTimeout(() => done(`No message from your teammates in ${seconds}s.`), seconds * 1000);
-      const onAbort = () => done("Stopped waiting (interrupted).");
-      signal.addEventListener("abort", onAbort, { once: true });
-      this.teammateWaiter = done;
-    });
-  }
-
-  hasNews(): boolean {
-    return this.pending.some((p) => p.wake && !p.fromSupervisor);
   }
 
   messageTeammate(to: string, text: string, expectsReply: boolean): string {
@@ -338,7 +300,7 @@ export class Agent implements SurvivalHost, Executive {
   state() {
     return {
       busy: this.busy,
-      asking: this.asking !== null,
+      asking: this.openQuestion !== null,
       plan: this.currentPlan && { goal: this.currentPlan.goal, steps: this.currentPlan.steps.map((s) => ({ ...s })) },
       usage: { ...this.totals },
     };
@@ -436,13 +398,12 @@ export class Agent implements SurvivalHost, Executive {
 
   /** Why ending the turn here would leave work undone, or null if it's a fine place to stop. */
   private unfinishedWork(reply: string): string | null {
-    if (this.asking) return null;
     const left = this.currentPlan?.steps.filter((s) => s.status === "doing" || s.status === "todo") ?? [];
     if (left.length && !this.currentPlan!.steps.some((s) => s.status === "blocked")) {
       return `Your plan "${this.currentPlan!.goal}" still has steps left (next: ${left[0]!.step}), but you ended your turn. Replies don't do anything in the world, and nothing will wake you to continue. Keep going now with tools. If you truly can't (waiting on the supervisor, or it's too dangerous right now), mark the step blocked with update_plan and say why in one line.`;
     }
     if (PROMISE.test(reply)) {
-      return "You said what you'll do, but ended your turn without doing it, and nothing will wake you later to do it. Do it now with tools. If it has to wait for something (daylight, a teammate), use wait or wait_for_teammate, then do it.";
+      return "You said what you'll do, but ended your turn without doing it, and nothing will wake you later to do it. Do it now with tools. If it depends on something that isn't ready (daylight, a teammate, a furnace), do other useful work now and come back to it when it is.";
     }
     return null;
   }

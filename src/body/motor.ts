@@ -363,7 +363,10 @@ export class Motor {
     await this.approach(pos, signal);
     if (item) await this.bot.equip(this.inventoryItem(item), "hand");
     const before = `${block.name} ${JSON.stringify(block.getProperties())}`;
-    await this.bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true);
+    // Buckets work by line of sight, so aim at the top surface: aimed at a pool's middle
+    // from the bank, the line passes through the bank first and the bucket stays empty.
+    const aim = item?.endsWith("bucket") ? 0.9 : 0.5;
+    await this.bot.lookAt(block.position.offset(0.5, aim, 0.5), true);
     await this.bot.waitForTicks(2); // the server needs to see where we're looking
     if (item?.endsWith("bucket")) {
       // Buckets act on whatever fluid or surface you're looking at, not the block itself.
@@ -374,6 +377,15 @@ export class Motor {
       await guard(this.bot, this.bot.activateBlock(block), signal, 5_000, `Using ${block.name}`);
     }
     await pause(250, signal);
+    if (item?.endsWith("bucket")) {
+      // A bucket changes what's in your hand, not the block you aimed at.
+      const held = this.bot.heldItem?.name ?? "nothing";
+      const used = normalizeName(item);
+      if (held === used) {
+        return `The ${used} didn't do anything at ${formatPos(pos)}. To fill a bucket, aim at a still source block (not flowing water) whose surface you can see, within reach; to pour, aim at a solid block's face.`;
+      }
+      return used === "bucket" ? `Filled the bucket: now holding ${held}.` : `Poured the ${used} out against ${block.name} at ${formatPos(pos)}; now holding ${held}.`;
+    }
     const now = this.blockAt(pos);
     const after = `${now.name} ${JSON.stringify(now.getProperties())}`;
     return `Used ${block.name} at ${formatPos(pos)}${item ? ` with ${normalizeName(item)}` : ""}. ${before === after ? "The block didn't change." : `Now: ${after}.`}${
@@ -581,7 +593,12 @@ export class Motor {
   }
 
   /** Smelts items in the nearest furnace, adding fuel from the inventory if needed. */
-  async smelt(item: string, count: number, signal: Signal) {
+  /**
+   * Loads a furnace and smelts. One item is waited for; a bigger batch is left cooking
+   * (about 10s an item) so the bot can do something else, unless `wait` is set
+   * (crafting needs the result right away). collectSmelted picks it up later.
+   */
+  async smelt(item: string, count: number, signal: Signal, options: { wait?: boolean } = {}) {
     const bot = this.bot;
     const input = itemByName(bot, item);
     const have = countById(bot, input.id);
@@ -594,6 +611,7 @@ export class Motor {
     const before = inventoryCounts(bot);
     const furnace = await bot.openFurnace(furnaceBlock);
     let left = 0;
+    let cooking = "";
     try {
       if (furnace.outputItem()) await furnace.takeOutput();
       const queued = furnace.inputItem();
@@ -611,14 +629,19 @@ export class Motor {
         await furnace.putFuel(fuel.item.type, null, units);
       }
       await furnace.putInput(input.id, null, amount);
-      const deadline = Date.now() + Math.min(amount * 10_500 + 3_000, 180_000);
-      while (Date.now() < deadline && (furnace.outputItem()?.count ?? 0) < amount) await pause(1_000, signal);
-      if (furnace.outputItem()) await furnace.takeOutput();
-      left = furnace.inputItem()?.count ?? 0;
+      if (!options.wait && amount > 1) {
+        cooking = `${amount} ${input.name} cooking in the furnace at ${formatPos(furnaceBlock.position)}, ready in about ${amount * 10}s. Do something else meanwhile, then collect_smelted there.`;
+      } else {
+        const deadline = Date.now() + Math.min(amount * 10_500 + 3_000, 180_000);
+        while (Date.now() < deadline && (furnace.outputItem()?.count ?? 0) < amount) await pause(1_000, signal);
+        if (furnace.outputItem()) await furnace.takeOutput();
+        left = furnace.inputItem()?.count ?? 0;
+      }
     } finally {
       furnace.close();
     }
     await syncInventory(bot);
+    if (cooking) return { change: inventoryDiff(before, inventoryCounts(bot)), cooking };
     return {
       change: inventoryDiff(before, inventoryCounts(bot)),
       ...(left ? { leftInFurnace: `${left} ${input.name} still in the furnace at ${formatPos(furnaceBlock.position)} (ran out of time or fuel).` } : {}),
@@ -709,6 +732,80 @@ export class Motor {
     return `In bed at ${where} (respawn point set there), but the night isn't passing: it only skips once every player is asleep${
       awake.length ? `, and ${awake.join(", ")} ${awake.length > 1 ? "are" : "is"} up` : ""
     }. Waiting won't make it pass sooner. Stay in bed (you'll wake at sunrise or if attacked), ask the others to sleep too, or get up and do something else.`;
+  }
+
+  /** Takes finished items out of a furnace (the nearest, or the one at `pos`) and says what's still cooking. */
+  async collectSmelted(pos: Pos | null, signal: Signal) {
+    const bot = this.bot;
+    const block = pos ? this.blockAt(pos) : this.nearestBlock(["furnace"]);
+    if (!block || block.name !== "furnace") throw new ActionError("NOT_FOUND", pos ? `No furnace at ${formatPos(pos)}.` : "No furnace within 32 blocks.");
+    await this.approach(block.position, signal);
+    const before = inventoryCounts(bot);
+    const furnace = await bot.openFurnace(block);
+    let still = "";
+    try {
+      if (furnace.outputItem()) await furnace.takeOutput();
+      const input = furnace.inputItem();
+      if (input) {
+        // The block's own "lit" state; the window's fuel numbers arrive late and out of order.
+        const burning = furnace.fuelItem() || String(bot.blockAt(block.position)?.getProperties().lit) === "true";
+        still = ` ${input.count} ${input.name} still cooking (about ${input.count * 10}s more)${burning ? "" : ", but the fuel ran out: smelt it again to add fuel"}.`;
+      }
+    } finally {
+      furnace.close();
+    }
+    await syncInventory(bot);
+    const got = inventoryDiff(before, inventoryCounts(bot));
+    return `Furnace at ${formatPos(block.position)}: took ${got === "no change" ? "nothing (nothing finished yet)" : got}.${still || " It's empty now."}`;
+  }
+
+  /** Fishes until `count` catches, or a few minutes pass, or the fish stop biting. */
+  async fish(count: number, signal: Signal) {
+    const bot = this.bot;
+    const rod = bot.inventory.items().find((i) => i.name === "fishing_rod");
+    if (!rod) throw new ActionError("MISSING_ITEMS", "No fishing_rod. Craft one from 3 sticks and 2 string (spiders drop string).");
+    // Open water, with water all around, so the cast lands in it rather than on the bank.
+    const water = this.bot.registry.blocksByName.water!.id;
+    const open = bot
+      .findBlocks({ matching: water, maxDistance: 16, count: 200 })
+      .filter((p) => bot.blockAt(p.offset(0, 1, 0))?.name === "air")
+      .filter((p) => NEIGHBORS.filter((n) => n.y === 0).every((n) => bot.blockAt(p.plus(n))?.name === "water"))
+      .sort((a, b) => distanceTo(bot, a) - distanceTo(bot, b))[0];
+    if (!open) throw new ActionError("NOT_FOUND", "No open water within 16 blocks to fish in.");
+    // Fish from a few blocks off: a long cast drops the catch short, into the water.
+    if (distanceTo(bot, open) > 5) await this.nav.go({ x: open.x, y: open.y + 1, z: open.z, range: 4 }, { signal, careful: true });
+    await bot.equip(rod, "hand");
+    const before = inventoryCounts(bot);
+    let caught = 0;
+    let misses = 0;
+    const deadline = Date.now() + Math.min(count * 45_000, 240_000);
+    while (caught < count && misses < 3 && Date.now() < deadline) {
+      await bot.lookAt(open.offset(0.5, 0.9, 0.5), true); // at the surface: a short, low cast
+      await bot.waitForTicks(2);
+      try {
+        await guard(bot, bot.fish(), signal, 45_000, "Waiting for a bite");
+        caught++;
+        // The catch flies to you; grab it if it lands just short, but don't wade out after it.
+        await pause(1_200, signal);
+        const stand = bot.entity.position.clone();
+        await this.collectDrops(stand, 3, signal).catch((err) => {
+          if (err instanceof Interrupted) throw err;
+        });
+        if (distanceTo(bot, stand) > 1.5) await this.nav.go({ x: stand.x, y: stand.y, z: stand.z, range: 1 }, { signal, careful: true }).catch(() => {});
+      } catch (err) {
+        if (err instanceof Interrupted) {
+          bot.activateItem(); // reel the line back in
+          throw err;
+        }
+        misses++;
+        bot.activateItem();
+        await pause(500, signal);
+      }
+    }
+    await syncInventory(bot);
+    const got = inventoryDiff(before, inventoryCounts(bot));
+    if (!caught) throw new ActionError("FAILED", `No bites in ${misses} casts at ${formatPos(open)}. Try deeper or bigger open water.`);
+    return `Caught ${caught}: ${got}. Cook fish before eating it (smelt).`;
   }
 
   async wake() {

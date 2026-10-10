@@ -4,7 +4,6 @@ import type { Bot } from "mineflayer";
 import vm from "node:vm";
 import { z } from "zod";
 import { apiReference, type Method } from "../api.js";
-import { pause } from "../body/motor.js";
 import { config, team } from "../config.js";
 import { ActionError } from "../errors.js";
 import { log } from "../log.js";
@@ -19,16 +18,13 @@ export type AgentTool = BetaRunnableTool<any> & { body: boolean };
 
 /** What the brain provides to tools that talk to the supervisor or manage the plan. */
 export interface Executive {
-  ask(question: string, options: string[] | undefined, signal: AbortSignal): Promise<string>;
+  /** Posts a question to the supervisor and returns at once; the answer arrives later as a message. */
+  ask(question: string, options: string[] | undefined): string;
   /** Sends the supervisor a message without waiting for a reply. */
   tell(text: string): void;
   /** Sends a teammate (or "team") a private message; returns who got it. */
   messageTeammate(to: string, text: string, expectsReply: boolean): string;
-  /** Waits for the next teammate message; returns it, or says none came. */
-  waitForTeammate(seconds: number, signal: AbortSignal): Promise<string>;
   plan(goal: string, steps: { step: string; status: string }[], note?: string): void;
-  /** Whether something that needs a decision (a survival alert, a teammate's request) is waiting. */
-  hasNews(): boolean;
 }
 
 export interface ToolDeps {
@@ -99,12 +95,6 @@ export function createTools({ bot, api, knowledge, memory, skills, executive }: 
             expect_reply: z.boolean().optional(),
           }),
           run: ({ to, text, expect_reply }) => executive.messageTeammate(to, text, expect_reply ?? false),
-        }),
-        tool({
-          name: "wait_for_teammate",
-          description: "Wait for a message from a teammate, e.g. your part of a team job from the lead, or a teammate finishing their part. Returns as soon as one arrives.",
-          input: z.object({ seconds: z.number().int().min(5).max(180).optional().describe("How long to wait at most (default 60)") }),
-          run: ({ seconds }, signal) => executive.waitForTeammate(seconds ?? 60, signal),
         }),
       ]
     : [];
@@ -297,10 +287,26 @@ export function createTools({ bot, api, knowledge, memory, skills, executive }: 
     }),
     tool({
       name: "smelt",
-      description: "Smelt items (raw_iron, sand, beef, logs for charcoal...) in a furnace, placing one if needed and adding fuel from your inventory. About 10 seconds per item.",
+      description:
+        "Smelt items (raw_iron, sand, beef, logs for charcoal...) in a furnace, placing one if needed and adding fuel from your inventory. Smelting takes about 10 seconds per item: a single item is done before this returns, but a bigger batch is left cooking and this returns at once with when it'll be ready. Do something else meanwhile, then come back and collect_smelted.",
       input: z.object({ item: z.string().describe("The input item"), count: z.number().int().min(1).max(64).optional() }),
       body: true,
       run: ({ item, count }, signal) => call("smelt", [item, count ?? 1], signal),
+    }),
+    tool({
+      name: "collect_smelted",
+      description: "Take whatever has finished smelting out of a furnace (the nearest one, or the one at x,y,z), walking there if needed. Says what's still cooking.",
+      input: z.object({ x: z.number().optional(), y: z.number().optional(), z: z.number().optional() }),
+      body: true,
+      run: ({ x, y, z: zc }, signal) => call("collectSmelted", [x !== undefined && y !== undefined && zc !== undefined ? { x, y, z: zc } : null], signal),
+    }),
+    tool({
+      name: "fish",
+      description:
+        "Fish with a fishing rod (3 sticks + 2 string) at water within 16 blocks, until you've caught `count` items or a few minutes pass. Steady food anywhere there's water: cod and salmon (cook them).",
+      input: z.object({ count: z.number().int().min(1).max(32).optional().describe("Default 5") }),
+      body: true,
+      run: ({ count }, signal) => call("fish", [count ?? 5], signal),
     }),
     tool({
       name: "dig",
@@ -419,34 +425,6 @@ export function createTools({ bot, api, knowledge, memory, skills, executive }: 
       body: true,
       run: ({ direction, distance }, signal) => call("explore", [direction, distance ?? 64], signal),
     }),
-    tool({
-      name: "wait",
-      description:
-        "Wait for something specific that takes time (a furnace, crops, a teammate arriving). Ends early if you're asleep and wake up, or if something needs your attention. Not for passing the night (work somewhere enclosed instead) and not for healing (health only regenerates at 18+ food: eat).",
-      input: z.object({ seconds: z.number().min(1).max(60) }),
-      run: async ({ seconds }, signal) => {
-        const started = Date.now();
-        const asleep = bot.isSleeping;
-        const elapsed = () => Math.round((Date.now() - started) / 1000);
-        while (Date.now() - started < seconds * 1000) {
-          if (asleep && !bot.isSleeping) {
-            await pause(1_100, signal); // the new time of day arrives up to a second after waking
-            return `Woke up after ${elapsed()}s. ${see.statusLine(bot)}`;
-          }
-          if (executive.hasNews()) return `Stopped waiting after ${elapsed()}s: something needs your attention (below). ${see.statusLine(bot)}`;
-          await pause(Math.min(500, seconds * 1000 - (Date.now() - started)), signal);
-        }
-        // Agents sit "waiting to heal" for many minutes at food 17, where health never comes back.
-        const noRegen =
-          bot.health < 20 && bot.food < 18
-            ? ` Health didn't regenerate and won't: that needs food at 18 or more (it's ${bot.food}). ${see.foods(bot).length ? "Eat now." : "Get food before anything else."}`
-            : "";
-        // Waiting out the dark is how a whole team ends up standing still for 7 minutes.
-        const t = bot.time.timeOfDay;
-        const night = t >= 13_000 && t < 23_000 && !bot.isSleeping ? " It's night: don't wait it out. Do something useful that's safe now (mine or tunnel underground, smelt, craft, build, hunt with a weapon), or sleep if you have a bed." : "";
-        return `Waited ${seconds}s. ${see.statusLine(bot)}${noRegen}${night}`;
-      },
-    }),
 
     // ---- Programming -------------------------------------------------------------
     tool({
@@ -538,9 +516,10 @@ ${apiReference(api)}`,
     }),
     tool({
       name: "ask_supervisor",
-      description: `Ask the supervisor a question and wait for the answer (up to ${config.askTimeoutMinutes} minutes, after which you carry on with your best judgment). Say what you tried, and offer concrete options when you can.`,
+      description:
+        "Ask the supervisor a question. It returns right away: keep doing useful work that doesn't depend on the answer, which arrives as a message whenever they reply. Say what you tried, and offer concrete options when you can.",
       input: z.object({ question: z.string(), options: z.array(z.string()).max(6).optional() }),
-      run: ({ question, options }, signal) => executive.ask(question, options, signal),
+      run: ({ question, options }) => executive.ask(question, options),
     }),
     tool({
       name: "report",

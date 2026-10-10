@@ -194,9 +194,13 @@ export function createApi({ bot, motor, knowledge, memory }: ApiDeps): Record<st
       "Craft an item and everything it needs in between (planks, sticks...), setting up a crafting table or furnace if needed. Throws MISSING_ITEMS listing raw materials to gather.",
       ([i, c], signal) => skills.craftItem(ctx, str(i, "item"), num(c, "count", 1), signal),
     ),
-    smelt: m(true, "smelt(input, count)", "Smelt items (places a furnace if needed, adds fuel from the inventory, waits ~10s per item).", ([i, c], signal) =>
+    smelt: m(true, "smelt(input, count)", "Smelt items (places a furnace if needed, adds fuel). One item is waited for; a bigger batch is left cooking (~10s an item) and this returns at once: collect it later with collectSmelted.", ([i, c], signal) =>
       skills.smeltItem(ctx, str(i, "input"), num(c, "count", 1), signal),
     ),
+    collectSmelted: m(true, "collectSmelted(pos?)", "Take finished items out of a furnace (nearest, or at pos); says what's still cooking.", ([p], signal) =>
+      motor.collectSmelted(p ? pos(p) : null, signal),
+    ),
+    fish: m(true, "fish(count)", "Fish with a fishing rod at open water within 16 blocks until count catches.", ([c], signal) => motor.fish(num(c, "count", 5), signal)),
     container: m(
       true,
       "container(action, {pos?, item?, count?})",
@@ -227,8 +231,8 @@ export function createApi({ bot, motor, knowledge, memory }: ApiDeps): Record<st
     wake: m(true, "wake()", "Get out of bed.", () => motor.wake()),
 
     // ---- Time, memory, chat ----
-    wait: m(false, "wait(ms)", "Pause the script (up to 2 minutes at a time).", async ([ms], signal) => {
-      await pause(Math.min(num(ms, "ms"), 120_000), signal);
+    wait: m(false, "wait(ms)", "Pause briefly, up to 2 seconds (e.g. for drops to land). Never wait for things like furnaces or daylight: do something else meanwhile.", async ([ms], signal) => {
+      await pause(Math.min(num(ms, "ms"), 2_000), signal);
       return "ok";
     }),
     say: m(false, "say(text)", "Send a message to the supervisor in chat.", ([t]) => {

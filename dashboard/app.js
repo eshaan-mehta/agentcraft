@@ -79,7 +79,7 @@ function firstLine(text, max = 200) {
 
 function agentState(row) {
   if (!row?.online) return { text: "offline", cls: "offline" };
-  if (row.asking) return { text: "waiting for your answer", cls: "asking" };
+  if (row.asking) return { text: "has a question for you", cls: "asking" };
   if (row.busy) return { text: "working", cls: "busy" };
   return { text: "idle", cls: "idle" };
 }

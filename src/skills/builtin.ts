@@ -72,7 +72,7 @@ export async function gather(
     const feetY = bot.entity.position.y;
     const target = bot
       .findBlocks({ matching: ids, maxDistance: radius, count: 256, point: center })
-      .filter((p) => !failed.has(p.toString()) && liquidBeside(bot, p) !== "lava")
+      .filter((p) => !failed.has(p.toString()) && liquidBeside(bot, p) !== "lava" && !unripe(bot, p))
       // Nearest first; prefer blocks with an open face, and ones you can reach without
       // climbing. Buried blocks (stone under dirt) are fine: the path digs down to them.
       // Avoid underwater ones (drowning) unless there's nothing else.
@@ -87,7 +87,8 @@ export async function gather(
       }))
       .sort((a, b) => a.score - b.score)[0]?.p;
     if (!target) {
-      stopped = `no more ${query} within ${radius} blocks of ${formatPos(center)}`;
+      const growing = bot.findBlocks({ matching: ids, maxDistance: radius, count: 64, point: center }).filter((p) => unripe(bot, p)).length;
+      stopped = `no more ${growing ? "ripe " : ""}${query} within ${radius} blocks of ${formatPos(center)}${growing ? ` (${growing} still growing)` : ""}`;
       break;
     }
     const block = bot.blockAt(target)!;
@@ -119,6 +120,15 @@ export async function gather(
     throw new ActionError(stopped.startsWith("no more") ? "NOT_FOUND" : "FAILED", `Mined nothing: ${stopped || "every attempt failed"}.${hint}`, result);
   }
   return result;
+}
+
+// Crops are only worth harvesting fully grown: an unripe one gives back just its seed.
+const RIPE_AGE: Record<string, number> = { wheat: 7, carrots: 7, potatoes: 7, beetroots: 3, nether_wart: 3, cocoa: 2 };
+
+function unripe(bot: Bot, p: Vec3): boolean {
+  const block = bot.blockAt(p);
+  const ripe = block ? RIPE_AGE[block.name] : undefined;
+  return ripe !== undefined && Number(block!.getProperties().age ?? ripe) < ripe;
 }
 
 /** Lava or water touching a block: mining it would let the liquid in on you. */
@@ -202,7 +212,7 @@ export async function craftItem(ctx: SkillContext, item: string, count: number, 
   for (const step of plan.steps) {
     if (signal?.aborted) throw new Interrupted();
     if (step.action === "craft") await motor.craft(step.item, step.count, signal);
-    else await motor.smelt(step.from!, step.count, signal);
+    else await motor.smelt(step.from!, step.count, signal, { wait: true }); // the next step needs it
   }
   const have = inventoryCounts(bot).get(name) ?? 0;
   return {

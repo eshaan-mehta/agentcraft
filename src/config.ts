@@ -61,7 +61,6 @@ export const config = {
   // How readily the bot stops to ask for guidance. Changeable at runtime with /ask.
   askMode: oneOf("ASK_MODE", env("ASK_MODE", "stuck"), ASK_MODES),
   // How long ask_supervisor waits for an answer before carrying on with its best guess.
-  askTimeoutMinutes: Number(env("ASK_TIMEOUT_MINUTES", "2")),
   // Survival reflexes always run. This controls whether survival needs (night is
   // coming, no food, just died) also wake Claude when it has no task, which costs tokens.
   autonomy: oneOf("SURVIVAL_AUTONOMY", env("SURVIVAL_AUTONOMY", "on"), ["on", "off"] as const) === "on",

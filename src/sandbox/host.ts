@@ -45,6 +45,11 @@ export function runScript(code: string, args: unknown, options: RunOptions): Pro
     child.stderr?.on("data", (chunk) => (stderr = (stderr + chunk).slice(-2000)));
 
     let settled = false;
+    // A result can come back after the script was stopped (an action finishing late
+    // after a reflex took over). By then the process is gone, so drop it quietly.
+    const send = (message: object) => {
+      if (!settled && child.connected) child.send(message, () => {});
+    };
     const finish = (result: Omit<ScriptResult, "logs" | "calls" | "seconds">) => {
       if (settled) return;
       settled = true;
@@ -80,22 +85,23 @@ export function runScript(code: string, args: unknown, options: RunOptions): Pro
         const pending = method?.body ? (bodyQueue = bodyQueue.catch(() => {}).then(execute)) : execute();
         pending.then(
           (value) => {
-            if (child.connected) child.send({ type: "result", id: message.id, ok: true, value: toJson(value) });
+            send({ type: "result", id: message.id, ok: true, value: toJson(value) });
           },
           (err: unknown) => {
             const raw = (err as { code?: unknown }).code;
             const code = err instanceof ActionError || err instanceof Interrupted ? err.code : typeof raw === "string" ? raw : "ERROR";
-            if (child.connected) child.send({ type: "result", id: message.id, ok: false, error: { message: errorText(err), code } });
+            send({ type: "result", id: message.id, ok: false, error: { message: errorText(err), code } });
           },
         );
       } else if (message.type === "done") {
         finish(message.ok ? { ok: true, value: message.value } : { ok: false, error: message.error });
       }
     });
+    child.on("error", (err) => finish({ ok: false, error: { message: `The sandbox process failed: ${err.message}` } }));
     child.on("exit", (code) =>
       finish({ ok: false, error: { message: `The sandbox process exited unexpectedly (code ${code}).${stderr ? ` ${stderr.trim().slice(-500)}` : ""}` } }),
     );
-    child.send({ type: "run", code, args: JSON.stringify(args ?? {}), skills: options.skills });
+    send({ type: "run", code, args: JSON.stringify(args ?? {}), skills: options.skills });
   });
 }
 

@@ -19,10 +19,40 @@ function wrap(text: string, limit: number): string[] {
   return lines;
 }
 
+// The server kicks a player who chats too fast ("disconnect.spam": about 10 lines in a
+// burst, then 1 a second), and private messages count. Every line goes through one
+// paced queue: a few at once, then one every 1.1s.
+const BURST = 5;
+const queue: (() => void)[] = [];
+let tokens = BURST;
+let refill: NodeJS.Timeout | null = null;
+
+function send(line: () => void) {
+  queue.push(line);
+  drain();
+}
+
+function drain() {
+  while (queue.length && tokens > 0) {
+    tokens--;
+    queue.shift()!();
+  }
+  if (refill || tokens >= BURST) return;
+  refill = setInterval(() => {
+    tokens = Math.min(BURST, tokens + 1);
+    drain();
+    if (tokens >= BURST && !queue.length) {
+      clearInterval(refill!);
+      refill = null;
+    }
+  }, 1_100);
+  refill.unref();
+}
+
 /** Sends text to in-game chat (where the supervisor reads it). Minecraft caps lines at 256 characters. */
 export function say(bot: Bot, text: string) {
   for (const line of wrap(text, 250)) {
-    bot.chat(line);
+    send(() => bot.chat(line));
     log.outgoing(line);
   }
 }
@@ -36,12 +66,14 @@ export function say(bot: Bot, text: string) {
 export function narrate(bot: Bot, text: string) {
   const recipients = Object.keys(bot.players).filter(isSupervisor);
   if (!recipients.length) return;
+  // Narration is the first thing to go when chat is backed up; the terminal has it anyway.
+  if (queue.length > 6) return;
   // "/tell name " takes up part of the 256-character limit.
-  for (const line of wrap(text, 200)) for (const name of recipients) bot.whisper(name, line);
+  for (const line of wrap(text, 200)) for (const name of recipients) send(() => bot.whisper(name, line));
   log.raw("narrate", { text, to: recipients });
 }
 
 /** Sends a teammate a private message they'll recognize as coming from their team. */
 export function messageTeammate(bot: Bot, to: string, text: string, expectsReply: boolean) {
-  for (const line of wrap(text, 190)) bot.whisper(to, `${teamPrefix(expectsReply)} ${line}`);
+  for (const line of wrap(text, 190)) send(() => bot.whisper(to, `${teamPrefix(expectsReply)} ${line}`));
 }

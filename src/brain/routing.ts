@@ -18,28 +18,39 @@ export function isSupervisor(username: string): boolean {
 }
 
 /**
- * Whether a public chat message from the supervisor is meant for this agent.
- * "Bob, ..." / "Bob: ..." / "@Bob ..." goes to Bob only; the same with a team name
- * goes to that team; "all, ..." / "@everyone ..." or no address goes to every agent.
- * Returns null if it's addressed to someone else.
+ * Whether a public chat message from the supervisor is meant for this agent, judged
+ * by the names it opens with. "Bob, ...", "bob ...", "@Bob ...", and "ace and bob ..."
+ * go to those agents only; "@red ..." or "red, ..." to that team; "all, ...",
+ * "everyone ...", or no names at all to every agent. Returns null if it's for others.
  */
 export function addressedToMe(message: string): Addressed | null {
   const me = config.mc.username.toLowerCase();
   const alone = team.others.length === 0;
-  const match = message.match(/^\s*@([A-Za-z0-9_]{1,16})[\s,:]+([\s\S]*)$/) ?? message.match(/^\s*([A-Za-z0-9_]{1,16})\s*[,:]\s*([\s\S]*)$/);
   const everyone: Addressed = { text: message.trim(), audience: alone ? "you" : "everyone" };
-  if (!match) return everyone;
+  const agents = new Map([[me, config.mc.username], ...team.roster.map((a) => [a.name.toLowerCase(), a.name] as const)]);
+  const teams = new Set(team.roster.map((a) => a.team?.toLowerCase()).filter((t): t is string => Boolean(t)));
 
-  const word = match[1]!.toLowerCase();
-  const rest = match[2]!.trim();
-  const agentNames = new Set([me, ...team.roster.map((a) => a.name.toLowerCase())]);
-  const teamNames = new Set(team.roster.map((a) => a.team?.toLowerCase()).filter((t): t is string => Boolean(t)));
+  const named: string[] = [];
+  let rest = message.trim();
+  for (;;) {
+    const match = rest.match(/^(@?)([A-Za-z0-9_]{1,16})(\s*[,:&]|\s+and(?=\s)|(?=\s)|$)\s*/i);
+    if (!match) break;
+    const word = match[2]!.toLowerCase();
+    // Team names are often ordinary words ("red wool..."), so they need an @ or a comma.
+    const marked = Boolean(match[1]) || /[,:]/.test(match[3]!);
+    if (!agents.has(word) && !EVERYONE.has(word) && !(marked && teams.has(word))) break;
+    named.push(word);
+    rest = rest.slice(match[0].length);
+  }
+  if (!named.length || named.some((n) => EVERYONE.has(n))) return everyone;
 
-  if (word === me) return { text: rest, audience: "you" };
-  if (team.name && word === team.name.toLowerCase()) return { text: rest, audience: `your team (${team.name})` };
-  if (EVERYONE.has(word)) return { text: rest, audience: alone ? "you" : "everyone" };
-  if (agentNames.has(word) || teamNames.has(word)) return null; // someone else's
-  return everyone; // "wood, please" isn't an address
+  const text = rest.trim() || message.trim();
+  if (named.includes(me)) {
+    const others = named.filter((n) => n !== me).map((n) => agents.get(n) ?? n);
+    return { text, audience: others.length && !alone ? `you and ${others.join(", ")}` : "you" };
+  }
+  if (team.name && named.includes(team.name.toLowerCase())) return { text, audience: `your team (${team.name})` };
+  return null; // someone else's
 }
 
 const TEAM_PREFIX = /^\[team(\?)?\]\s*([\s\S]*)$/;

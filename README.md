@@ -1,16 +1,15 @@
 # agentcraft
 
-Autonomous Claude agents that live in a Minecraft world. You give them goals in plain language ("get a stack of oak planks", "make yourself an iron pickaxe", "build me a house") and they work out the rest: they plan, act, check their results, adapt when something fails, and ask you when they're stuck. They also look after themselves, so they survive the night on their own. You supervise as an invisible spectator, and can run one agent or a whole team.
+The Truman Show, for AI agents. Claude agents live in a Minecraft world: they gather and craft, build, eat, take shelter when night falls, and fend off whatever comes out of the dark, alone or as a team. No humans walk their world; the only cast is the agents themselves. You're the audience and the director. Watch from inside the world as an invisible spectator, follow their thinking from a control room, and step in whenever you like to hand them a goal or answer a question.
 
-## What it does
+## Life inside
 
-- **Understands open-ended goals.** Agents plan with real game data (recipes, tool tiers, drops) instead of guessing, then carry out the plan with reliable built-in actions.
-- **Learns new abilities.** For anything the built-in actions don't cover, an agent writes its own code, runs it in a sandbox, and saves what works as a skill it can reuse later.
-- **Remembers.** Places, chest contents, lessons learned, and your standing orders persist across sessions, and so does the conversation itself.
-- **Asks when it should.** You choose how often: before anything ambiguous, only when stuck, or rarely.
-- **Survives on its own.** Reflexes fight or flee from mobs, eat, and wear armor in real time; the agent itself plans for nightfall, hunger, and shelter.
-- **Works in teams.** Run several agents at once. Teammates share knowledge and skills and split up jobs; agents on their own figure everything out independently.
-- **Shows its work.** A local dashboard shows what each agent is thinking and doing and what it's spending, and lets you chat with it.
+- **They look after themselves.** Reflexes fight or flee from mobs, eat, and put on armor in real time. Between jobs, an agent notices nightfall, hunger, and missing gear and deals with them on its own.
+- **They take direction.** Give one a goal in plain language ("get a stack of oak planks", "make yourself an iron pickaxe", "build me a house") and it works out the rest: it plans with real game data (recipes, tool tiers, drops), acts, checks what actually happened, and adapts when something fails.
+- **They learn.** When the built-in actions don't cover something, an agent writes its own code, runs it in a sandbox, and keeps what works as a skill.
+- **They remember.** Places, chest contents, lessons learned, standing orders, and the conversation itself survive restarts.
+- **They live together or apart.** Teammates share knowledge and skills and split up jobs; an agent on its own figures everything out by itself.
+- **They ask when they're unsure.** You choose how often: before anything ambiguous, only when stuck, or rarely.
 
 ## How it works
 
@@ -37,13 +36,18 @@ npm run server           # leave running; in its console, once: op YourName, the
 npm start                # in a second terminal: starts an agent named Claude
 ```
 
-The agent uses `ANTHROPIC_API_KEY` from `.env` if set, otherwise your Anthropic CLI login. In Minecraft, join `localhost` and run `/spectate Claude` to watch through its eyes.
+The agent uses `ANTHROPIC_API_KEY` from `.env` if set, otherwise your Anthropic CLI login.
 
-## Using it
+## Watching
 
-- **Talk to it** in game chat, in its terminal, or from the dashboard. Say `stop` to halt it at once. It sends you its plan as private messages in game, and questions show up in chat; just reply.
-- **Run a team:** `npm run agents -- Claude:red Bob:red Eve` starts Claude and Bob as team "red" and Eve on her own. Address one with `Bob, get wood`, a team with `@red build a wall`, or everyone with no name.
-- **Watch and chat:** `npm run dashboard`, then open http://127.0.0.1:4321 for total spend, a live card per agent, and a per-agent view with chat and a feed of its thinking, plans, and actions.
+- **From inside the world:** join `localhost` in Minecraft and run `/spectate Claude` to see through its eyes. It sends you its plan as private messages.
+- **From the control room:** `npm run dashboard`, then open http://127.0.0.1:4321 for total spend, a live card per agent, and a per-agent feed of thinking, plans, and actions with a chat box.
+- **From the terminal:** each agent prints its reasoning and actions as it works, and keeps a full transcript in `logs/`.
+
+## Stepping in
+
+- **Talk to them** in game chat, an agent's terminal, or the dashboard. Say `stop` to halt one at once. Questions show up in chat; just reply.
+- **Cast more agents:** `npm run agents -- Claude:red Bob:red Eve` starts Claude and Bob as team "red" and Eve solo. Address one with `Bob, get wood`, a team with `@red build a wall`, or everyone with no name.
 - **Check spend:** `/usage` in an agent's terminal, or `npm run usage` for all sessions.
 
 All settings live in `.env`. `.env.example` explains each one, including the model, how often agents ask, who counts as a supervisor, and whether survival needs wake the agent.

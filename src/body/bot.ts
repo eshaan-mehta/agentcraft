@@ -18,6 +18,8 @@ export interface MovementProfiles {
   normal: InstanceType<typeof Movements>;
   /** Walks only: never breaks or places blocks on the way. */
   careful: InstanceType<typeof Movements>;
+  /** Running from mobs: walks only, no jumps across gaps, no drops over 2 blocks. */
+  flee: InstanceType<typeof Movements>;
 }
 
 export async function connect(): Promise<{ bot: Bot; movements: MovementProfiles }> {
@@ -54,10 +56,25 @@ export async function connect(): Promise<{ bot: Bot; movements: MovementProfiles
   careful.allow1by1towers = false;
   careful.scafoldingBlocks = [];
 
+  // Fleeing into a ravine, a lava cave, or deep water kills more often than the mob.
+  const flee = new Movements(bot);
+  flee.canDig = false;
+  flee.allow1by1towers = false;
+  flee.scafoldingBlocks = [];
+  flee.allowParkour = false;
+  flee.maxDropDown = 2;
+
+  for (const profile of [normal, careful, flee]) {
+    // By default a path may drop any distance into water, which is how bots end up at
+    // the bottom of flooded caves. Keep to the normal drop limit, and prefer dry routes.
+    profile.infiniteLiquidDropdownDistance = false;
+    (profile as typeof profile & { liquidCost: number }).liquidCost = 4; // not in the type definitions
+  }
+
   bot.pathfinder.setMovements(normal);
   // Plan in 40ms slices per tick, for up to 10s per plan. The navigator replans from
   // wherever a partial route ends, so a long trip doesn't need one huge plan.
   bot.pathfinder.thinkTimeout = 10_000;
   bot.pathfinder.tickTimeout = 40;
-  return { bot, movements: { normal, careful } };
+  return { bot, movements: { normal, careful, flee } };
 }

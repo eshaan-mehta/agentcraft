@@ -61,7 +61,7 @@ export const config = {
   // How readily the bot stops to ask for guidance. Changeable at runtime with /ask.
   askMode: oneOf("ASK_MODE", env("ASK_MODE", "stuck"), ASK_MODES),
   // How long ask_supervisor waits for an answer before carrying on with its best guess.
-  askTimeoutMinutes: Number(env("ASK_TIMEOUT_MINUTES", "5")),
+  askTimeoutMinutes: Number(env("ASK_TIMEOUT_MINUTES", "2")),
   // Survival reflexes always run. This controls whether survival needs (night is
   // coming, no food, just died) also wake Claude when it has no task, which costs tokens.
   autonomy: oneOf("SURVIVAL_AUTONOMY", env("SURVIVAL_AUTONOMY", "on"), ["on", "off"] as const) === "on",
@@ -70,7 +70,7 @@ export const config = {
   // Restore the previous conversation on startup (saved after every step).
   resume: oneOf("RESUME_SESSION", env("RESUME_SESSION", "on"), ["on", "off"] as const) === "on",
   // Longest a single run_code script may run.
-  maxScriptSeconds: Number(env("MAX_SCRIPT_SECONDS", "300")),
+  maxScriptSeconds: Number(env("MAX_SCRIPT_SECONDS", "180")),
   logDir: env("LOG_DIR", "logs"),
   // This agent's own state: its saved conversation.
   dataDir: env("DATA_DIR", "data"),

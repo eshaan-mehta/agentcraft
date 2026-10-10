@@ -27,7 +27,9 @@ export type Target =
   /** Get within `range` of an entity, following it if it moves (default 2). */
   | { entity: Entity; range?: number }
   /** Get at least `distance` blocks away from a point or entity. */
-  | { awayFrom: Point | Entity; distance: number };
+  | { awayFrom: Point | Entity; distance: number }
+  /** Get up (or down) to height `y`, wherever that's quickest. */
+  | { y: number };
 
 export interface NavOptions {
   signal?: AbortSignal;
@@ -88,6 +90,7 @@ export class Navigator {
     const timeoutMs = options.timeoutMs ?? Math.min(30_000 + remaining() * 1_500, 600_000);
     let best = remaining();
     let lastProgress = Date.now();
+    let lastCloser = Date.now();
     let status = "";
     let planned = false;
     let reached = false;
@@ -116,11 +119,13 @@ export class Navigator {
           return { position: formatPos(pos), seconds: Math.round((Date.now() - started) / 1000), replans };
         }
         const left = remaining();
-        // Digging or bridging counts as progress even when the distance doesn't change.
-        if (left < best - 1 || bot.pathfinder.isMining() || bot.pathfinder.isBuilding()) {
-          best = Math.min(best, left);
-          lastProgress = Date.now();
+        if (left < best - 1) {
+          best = left;
+          lastProgress = lastCloser = Date.now();
         }
+        // Digging or bridging counts as progress even when the distance doesn't change,
+        // but not for long: a bot tunneling in place for a minute is stuck.
+        if ((bot.pathfinder.isMining() || bot.pathfinder.isBuilding()) && Date.now() - lastCloser < 45_000) lastProgress = Date.now();
         if (planned && !bot.pathfinder.isMoving()) {
           // The route ran out short of the goal: a partial plan, or no route at all.
           if (noRoute >= 2) {
@@ -148,6 +153,11 @@ export class Navigator {
       bot.pathfinder.setGoal(null);
       if (options.careful) bot.pathfinder.setMovements(this.movements.normal);
     }
+  }
+
+  /** Switches the pathfinder's movement rules, for callers that set goals themselves (the flee reflex). */
+  use(profile: keyof MovementProfiles) {
+    this.bot.pathfinder.setMovements(this.movements[profile]);
   }
 
   /** Plans a route without moving, to check whether and how far a target is reachable. */
@@ -207,6 +217,10 @@ export class Navigator {
         remaining: () => Math.max(0, target.distance - here().distanceTo(where())),
         label: `${target.distance} blocks away from ${isEntity(from) ? from.name : formatPos(where())}`,
       };
+    }
+    if (!("x" in target)) {
+      const y = Math.floor(target.y);
+      return { goal: new goals.GoalY(y), dynamic: false, remaining: () => Math.abs(Math.floor(here().y) - y), label: `height ${y}` };
     }
     const range = target.range ?? 1;
     if ("y" in target && target.y !== undefined) {

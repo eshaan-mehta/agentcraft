@@ -43,8 +43,9 @@ const api = createApi({ bot, motor, knowledge, memory });
 const agent = new Agent({ bot, body, memory, skills, session: new SessionStore(path.join(config.dataDir, "conversation.json")) });
 agent.setTools(createTools({ bot, api, knowledge, memory, skills, executive: agent }));
 log.info(agent.restore());
-const survival = new Survival(bot, body, motor);
+const survival = new Survival(bot, body, motor, (signal) => api.buildShelter!.run([], signal) as Promise<string>);
 survival.start(agent);
+agent.resumeIfInterrupted();
 
 log.info(`Joined at ${formatPos(bot.entity.position)}. Model ${config.claude.model}, effort ${config.claude.effort}, ask mode "${config.askMode}".`);
 log.info(`Survival reflexes on; self-directed survival turns ${config.autonomy ? "on" : "off"}. ${skills.list().length} saved skills.`);

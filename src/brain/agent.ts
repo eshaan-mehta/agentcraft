@@ -18,6 +18,9 @@ type ToolUse = Anthropic.Beta.BetaToolUseBlock;
 type ToolResult = Anthropic.Beta.BetaToolResultBlockParam;
 
 const STOP_WORDS = /^(stop|halt|cancel|freeze)\W*$/i;
+// A reply that announces work instead of doing it ("I'll head out at dawn", "next I'll mine").
+const PROMISE = /\b(I'll|I will|I'm going to|I am going to|I plan to|I should|next,? I|then I|once [^.]{0,60}\bI)\b/i;
+const MAX_NUDGES = 2;
 const NEW_MESSAGE = "Stopped partway because the supervisor sent a new message (below). Whatever this call already did still stands.";
 
 // Models that accept `fallbacks: "default"`, which re-runs a request on another
@@ -101,6 +104,8 @@ export class Agent implements SurvivalHost, Executive {
   private currentCall: AbortController | null = null;
   /** A supervisor message arrived mid-turn and Claude hasn't read it yet. */
   private unread = false;
+  /** The restored conversation stopped partway through a turn (a crash or dropped connection). */
+  private interruptedTurn = false;
   private asking: ((from: string, answer: string) => void) | null = null;
   private idleSince = Date.now();
   private teammateWakes: number[] = [];
@@ -133,6 +138,8 @@ export class Agent implements SurvivalHost, Executive {
       const missing = [...toolsUsed(saved.messages)].filter((name) => !this.tools.has(name));
       if (!missing.length) {
         this.messages = closeOpenToolCalls(saved.messages);
+        // Unfinished: it ended on a tool call (now closed) or on input Claude never answered.
+        this.interruptedTurn = this.messages.at(-1)?.role !== "assistant";
         this.dropStaleThinking = saved.fingerprint !== this.fingerprint;
         return `Resumed the previous conversation (${saved.messages.length} messages, last saved ${saved.savedAt.slice(0, 16).replace("T", " ")} UTC)${
           this.dropStaleThinking ? "; the code changed since then, so reasoning blocks from before won't be replayed" : ""
@@ -270,6 +277,10 @@ export class Agent implements SurvivalHost, Executive {
     });
   }
 
+  hasNews(): boolean {
+    return this.pending.some((p) => p.wake && !p.fromSupervisor);
+  }
+
   messageTeammate(to: string, text: string, expectsReply: boolean): string {
     const targets = to.toLowerCase() === "team" ? team.mates : team.mates.filter((m) => m.toLowerCase() === to.toLowerCase());
     if (!targets.length) {
@@ -289,7 +300,21 @@ export class Agent implements SurvivalHost, Executive {
   interrupt() {
     this.abort?.abort();
     this.body.halt();
+    // A halted plan isn't unfinished work to get back to (see unfinishedWork).
+    this.currentPlan = null;
     say(this.bot, "Stopped.");
+  }
+
+  /** After a restart mid-task, picks the work back up instead of standing idle. */
+  resumeIfInterrupted() {
+    if (!this.interruptedTurn) return;
+    this.interruptedTurn = false;
+    this.pending.push({
+      text: "[system] You were restarted partway through your work (the program or the connection dropped). Check your status and carry on where you left off.",
+      wake: true,
+      fromSupervisor: false,
+    });
+    if (!this.busy) void this.run();
   }
 
   /** Forgets the conversation so the next task starts fresh. Memory and skills persist. */
@@ -337,6 +362,7 @@ export class Agent implements SurvivalHost, Executive {
       let batch = this.takePending(true);
       // Replies go to chat only when the supervisor asked for something.
       let supervisorAsked = batch.fromSupervisor;
+      let nudges = 0;
       this.pushUser(messages, batch.text);
       while (!abort.signal.aborted) {
         const response = await this.request(messages, abort.signal);
@@ -384,6 +410,16 @@ export class Agent implements SurvivalHost, Executive {
         if (reply && supervisorAsked) say(this.bot, reply);
         else if (reply) log.info(`Claude (not sent to chat): ${reply}`);
 
+        // Ending the turn with work left means nothing happens until something wakes the
+        // agent, so "I'll do X" never gets done. Send it back to work (a bounded number of times).
+        const unfinished = response.stop_reason === "end_turn" && !this.pending.some((p) => p.wake) ? this.unfinishedWork(reply) : null;
+        if (unfinished && nudges < MAX_NUDGES) {
+          nudges++;
+          log.info(`Nudged to keep going: ${unfinished}`);
+          this.pushUser(messages, `[system] ${unfinished}`);
+          continue;
+        }
+
         if (!this.pending.some((p) => p.wake)) break;
         batch = this.takePending(true);
         supervisorAsked = batch.fromSupervisor;
@@ -398,9 +434,29 @@ export class Agent implements SurvivalHost, Executive {
     }
   }
 
+  /** Why ending the turn here would leave work undone, or null if it's a fine place to stop. */
+  private unfinishedWork(reply: string): string | null {
+    if (this.asking) return null;
+    const left = this.currentPlan?.steps.filter((s) => s.status === "doing" || s.status === "todo") ?? [];
+    if (left.length && !this.currentPlan!.steps.some((s) => s.status === "blocked")) {
+      return `Your plan "${this.currentPlan!.goal}" still has steps left (next: ${left[0]!.step}), but you ended your turn. Replies don't do anything in the world, and nothing will wake you to continue. Keep going now with tools. If you truly can't (waiting on the supervisor, or it's too dangerous right now), mark the step blocked with update_plan and say why in one line.`;
+    }
+    if (PROMISE.test(reply)) {
+      return "You said what you'll do, but ended your turn without doing it, and nothing will wake you later to do it. Do it now with tools. If it has to wait for something (daylight, a teammate), use wait or wait_for_teammate, then do it.";
+    }
+    return null;
+  }
+
   /** Appends a user message, followed by any pending system notes (e.g. an ask-mode change). */
   private pushUser(messages: Anthropic.Beta.BetaMessageParam[], content: string | Anthropic.Beta.BetaContentBlockParam[]) {
-    messages.push({ role: "user", content });
+    const last = messages.at(-1);
+    if (last?.role === "user") {
+      // Resuming a turn a restart cut off: add to its unanswered message instead of starting a second one.
+      const blocks = (c: typeof content): Anthropic.Beta.BetaContentBlockParam[] => (typeof c === "string" ? [{ type: "text", text: c }] : c);
+      last.content = [...blocks(last.content), ...blocks(content)];
+    } else {
+      messages.push({ role: "user", content });
+    }
     for (const note of this.systemNotes.splice(0)) messages.push({ role: "system", content: note });
     this.persist(messages);
   }

@@ -124,6 +124,7 @@ export function createApi({ bot, motor, knowledge, memory }: ApiDeps): Record<st
     info: m(false, "info(name)", "Facts about a block, item, or mob: hardness, tool, drops, food value, stack size.", ([n]) => knowledge.info(str(n, "name"))),
 
     // ---- Movement ----
+    goToSurface: m(true, "goToSurface()", "Climb out from underground to the open ground above, digging a staircase if needed.", (_args, signal) => motor.goToSurface(signal)),
     goTo: m(
       true,
       "goTo(target, {careful?, timeoutMs?})",

@@ -134,7 +134,7 @@ function swingCooldown(item: string | undefined): number {
   return 300; // fists, blocks, and anything else swing 4 times a second
 }
 
-export type FightResult = "killed" | "timeout" | "unreachable" | "lost" | "low_health";
+export type FightResult = "killed" | "timeout" | "unreachable" | "lost" | "low_health" | "stopped";
 export type Slot = "hand" | "off-hand" | "head" | "torso" | "legs" | "feet";
 
 export class Motor {
@@ -148,6 +148,26 @@ export class Motor {
 
   goTo(target: Target, options: NavOptions = {}) {
     return this.nav.go(target, options);
+  }
+
+  /** Climbs out from underground to the height of the open ground above, digging a staircase if needed. */
+  async goToSurface(signal: Signal) {
+    const bot = this.bot;
+    const here = bot.entity.position.floored();
+    const game = bot.game as { minY?: number; height?: number }; // set by mineflayer, missing from its types
+    const top = (game.minY ?? -64) + (game.height ?? 384);
+    // The highest solid block in this column, not counting trees.
+    let surface = here.y;
+    for (let y = Math.min(top - 1, here.y + 160); y > here.y + 1; y--) {
+      const block = bot.blockAt(new Vec3(here.x, y, here.z));
+      if (block?.boundingBox === "block" && !/_(leaves|log|wood)$/.test(block.name)) {
+        surface = y + 1;
+        break;
+      }
+    }
+    if (surface <= here.y) return `Already at the surface: nothing solid above ${formatPos(here)}.`;
+    const arrival = await this.nav.go({ y: surface }, { signal, timeoutMs: 180_000 });
+    return `Climbed from ${formatPos(here)} up to the surface at ${arrival.position} in ${arrival.seconds}s.`;
   }
 
   inReach(pos: Pos): boolean {
@@ -426,14 +446,17 @@ export class Motor {
 
   /**
    * Chases and hits an entity with the best weapon on hand until it dies, gets away,
-   * can't be reached (no closer for 8s), time runs out, or health drops to `stopAtHealth`.
+   * can't be reached (no closer for 8s), time runs out, health drops to `stopAtHealth`,
+   * or `stopIf` says something more urgent came up.
    */
-  async fight(target: Entity, options: { signal?: Signal; timeoutMs: number; stopAtHealth?: number }): Promise<FightResult> {
+  async fight(target: Entity, options: { signal?: Signal; timeoutMs: number; stopAtHealth?: number; stopIf?: () => boolean }): Promise<FightResult> {
     const bot = this.bot;
     const weapon = bestWeapon(bot);
     if (weapon && bot.heldItem?.type !== weapon.type) await bot.equip(weapon, "hand");
     const chase = new goals.GoalFollow(target, 1.5);
     const deadline = Date.now() + options.timeoutMs;
+    // "Got away" means it's getting farther than it started, not just far (hunt picks targets up to 48 blocks off).
+    const lostAt = Math.max(24, distanceTo(bot, target.position) + 12);
     let closest = Infinity;
     let lastProgress = Date.now();
     try {
@@ -443,8 +466,9 @@ export class Motor {
         if (bot.pathfinder.goal !== chase) bot.pathfinder.setGoal(chase, true);
         if (Date.now() > deadline) return "timeout";
         if (options.stopAtHealth !== undefined && bot.health <= options.stopAtHealth) return "low_health";
+        if (options.stopIf?.()) return "stopped";
         const d = distanceTo(bot, target.position);
-        if (d > 24) return "lost";
+        if (d > lostAt) return "lost";
         if (d < closest - 0.5) {
           closest = d;
           lastProgress = Date.now();

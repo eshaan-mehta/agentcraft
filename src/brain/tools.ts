@@ -4,7 +4,7 @@ import type { Bot } from "mineflayer";
 import vm from "node:vm";
 import { z } from "zod";
 import { apiReference, type Method } from "../api.js";
-import { pause, wokeWithin } from "../body/motor.js";
+import { pause } from "../body/motor.js";
 import { config, team } from "../config.js";
 import { ActionError } from "../errors.js";
 import { log } from "../log.js";
@@ -27,6 +27,8 @@ export interface Executive {
   /** Waits for the next teammate message; returns it, or says none came. */
   waitForTeammate(seconds: number, signal: AbortSignal): Promise<string>;
   plan(goal: string, steps: { step: string; status: string }[], note?: string): void;
+  /** Whether something that needs a decision (a survival alert, a teammate's request) is waiting. */
+  hasNews(): boolean;
 }
 
 export interface ToolDeps {
@@ -112,7 +114,7 @@ export function createTools({ bot, api, knowledge, memory, skills, executive }: 
       api,
       skills: skills.sources(),
       signal,
-      timeoutMs: Math.min(timeoutSeconds ?? 120, config.maxScriptSeconds) * 1000,
+      timeoutMs: Math.min(timeoutSeconds ?? 90, config.maxScriptSeconds) * 1000,
       onLog: (text) => log.scriptOutput(text),
     });
     return result;
@@ -266,6 +268,13 @@ export function createTools({ bot, api, knowledge, memory, skills, executive }: 
       },
     }),
     tool({
+      name: "go_to_surface",
+      description: "Get out from underground: climbs to the height of the open ground above you, digging a staircase if needed. Much faster and safer than digging up by hand.",
+      input: z.object({}),
+      body: true,
+      run: (_args, signal) => call("goToSurface", [], signal),
+    }),
+    tool({
       name: "gather",
       description:
         "Mine a number of blocks (e.g. 16 oak_log, 'log' for any log, 'stone'), nearest and lowest first around you or a point, picking up the drops. Item names work too: 'cobblestone' mines stone, 'raw_iron' mines iron ore, 'coal' mines coal ore. Skips targets it can't reach; reports what it got and why it stopped.",
@@ -412,18 +421,30 @@ export function createTools({ bot, api, knowledge, memory, skills, executive }: 
     }),
     tool({
       name: "wait",
-      description: "Wait for something to happen (crops to grow, a furnace, daylight). Ends early if you're asleep and wake up.",
-      input: z.object({ seconds: z.number().min(1).max(120) }),
+      description:
+        "Wait for something specific that takes time (a furnace, crops, a teammate arriving). Ends early if you're asleep and wake up, or if something needs your attention. Not for passing the night (work somewhere enclosed instead) and not for healing (health only regenerates at 18+ food: eat).",
+      input: z.object({ seconds: z.number().min(1).max(60) }),
       run: async ({ seconds }, signal) => {
         const started = Date.now();
-        if (bot.isSleeping) {
-          if (await wokeWithin(bot, seconds * 1000, signal)) {
-            return `Woke up after ${Math.round((Date.now() - started) / 1000)}s. ${see.statusLine(bot)}`;
+        const asleep = bot.isSleeping;
+        const elapsed = () => Math.round((Date.now() - started) / 1000);
+        while (Date.now() - started < seconds * 1000) {
+          if (asleep && !bot.isSleeping) {
+            await pause(1_100, signal); // the new time of day arrives up to a second after waking
+            return `Woke up after ${elapsed()}s. ${see.statusLine(bot)}`;
           }
-        } else {
-          await pause(seconds * 1000, signal);
+          if (executive.hasNews()) return `Stopped waiting after ${elapsed()}s: something needs your attention (below). ${see.statusLine(bot)}`;
+          await pause(Math.min(500, seconds * 1000 - (Date.now() - started)), signal);
         }
-        return `Waited ${seconds}s. ${see.statusLine(bot)}`;
+        // Agents sit "waiting to heal" for many minutes at food 17, where health never comes back.
+        const noRegen =
+          bot.health < 20 && bot.food < 18
+            ? ` Health didn't regenerate and won't: that needs food at 18 or more (it's ${bot.food}). ${see.foods(bot).length ? "Eat now." : "Get food before anything else."}`
+            : "";
+        // Waiting out the dark is how a whole team ends up standing still for 7 minutes.
+        const t = bot.time.timeOfDay;
+        const night = t >= 13_000 && t < 23_000 && !bot.isSleeping ? " It's night: don't wait it out. Do something useful that's safe now (mine or tunnel underground, smelt, craft, build, hunt with a weapon), or sleep if you have a bed." : "";
+        return `Waited ${seconds}s. ${see.statusLine(bot)}${noRegen}${night}`;
       },
     }),
 
@@ -438,7 +459,7 @@ ${apiReference(api)}`,
         purpose: z.string().describe("One line: what this script does"),
         code: z.string(),
         args: z.record(z.string(), z.unknown()).optional().describe("Passed to the script as `args`"),
-        timeout_seconds: z.number().int().min(5).max(600).optional().describe(`Default 120, max ${config.maxScriptSeconds}`),
+        timeout_seconds: z.number().int().min(5).max(600).optional().describe(`Default 90, max ${config.maxScriptSeconds}`),
       }),
       body: true,
       run: async ({ purpose, code, args, timeout_seconds }, signal) => {

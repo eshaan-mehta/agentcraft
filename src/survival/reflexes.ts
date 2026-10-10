@@ -9,9 +9,9 @@ import { Vec3 } from "vec3";
 import type { Body } from "../body/body.js";
 import type { Motor } from "../body/motor.js";
 import { config } from "../config.js";
-import { Died, abortError, errorText } from "../errors.js";
+import { Died, Interrupted, abortError, errorText } from "../errors.js";
 import { log } from "../log.js";
-import { bestWeapon, distanceTo, equipment, foods, formatPos, isHostile, isSheltered, readiness, shelterBlocks } from "../world/perception.js";
+import { bestWeapon, distanceTo, enclosure, equipment, foods, formatPos, isHostile, isSheltered, readiness, shelterBlocks } from "../world/perception.js";
 
 const { goals } = pathfinderPkg;
 type Entity = Bot["entity"];
@@ -35,6 +35,7 @@ const ATTACKER_RANGE = 24; // how far to go after something that just hit us (sk
 const RUN_FROM = new Set(["creeper", "warden"]);
 const RUN_FROM_RANGE = 12; // creepers: start running well before the 3-block fuse range
 const LOW_HEALTH = 6; // 3 hearts: stop fighting and run
+const HURT = 12; // unarmed, stop trading blows; caught, seal in (digging in takes ~3s of being hit)
 const EAT_AT_FOOD = 14;
 const STARVING = 6; // at or below this, eat even if it interrupts a task
 const LOW_AIR = 12; // of 20: about 9 seconds left before drowning starts
@@ -49,6 +50,15 @@ const ARMOR = [
   { suffix: "_leggings", slot: "legs" },
   { suffix: "_boots", slot: "feet" },
 ] as const;
+
+function capitalize(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/** Air from 0 to 20. (Mineflayer's reading can briefly be out of range on newer versions.) */
+function air(bot: Bot): number {
+  return Math.max(0, Math.min(20, bot.oxygenLevel ?? 20));
+}
 
 function armorRank(name: string | null): number {
   if (!name) return -1;
@@ -71,6 +81,7 @@ export class Survival {
   private lastReport = new Map<string, number>();
   private eveningAlertDay = -1;
   private shelteredTonight = false;
+  private nightSeen = false;
   private deaths: { at: number; where: string }[] = [];
   private deathCount = 0;
   private deathAlertTimer: NodeJS.Timeout | null = null;
@@ -81,6 +92,8 @@ export class Survival {
     private readonly bot: Bot,
     private readonly body: Body,
     private readonly motor: Motor,
+    /** Seals the bot in where it stands (dig in, or wall in with a roof). */
+    private readonly shelter: (signal: AbortSignal) => Promise<string>,
   ) {}
 
   start(host: SurvivalHost) {
@@ -105,7 +118,7 @@ export class Survival {
     const bot = this.bot;
     if (this.busy || !bot.entity || bot.health <= 0) return;
     this.stayAfloat();
-    if (bot.oxygenLevel <= LOW_AIR && this.headUnderwater()) return this.takeOver("air", (signal) => this.surface(signal));
+    if (bot.oxygenLevel <= LOW_AIR && this.submerged()) return this.takeOver("air", (signal) => this.surface(signal));
 
     const threats = this.threats();
     if (threats.length) {
@@ -169,19 +182,22 @@ export class Survival {
     const me = bot.entity.position;
     const threats = Object.values(bot.entities)
       .filter((e) => {
-        if (e === bot.entity || !e.isValid || (this.ignored.get(e.id) ?? 0) > now) return false;
+        if (e === bot.entity || !e.isValid) return false;
         const d = e.position.distanceTo(me);
-        // Whatever just hit us, even if it's normally peaceful (a provoked enderman, a wolf).
+        // Whatever just hit us, even if it's normally peaceful (a provoked enderman, a wolf),
+        // and even if we'd given up on reaching it: it can clearly reach us.
         if (e === recent) return e.type !== "player" && d <= ATTACKER_RANGE;
+        if ((this.ignored.get(e.id) ?? 0) > now) return false;
         if (RUN_FROM.has(e.name ?? "")) return d <= RUN_FROM_RANGE;
         if (!isHostile(e)) return false;
         return d <= THREAT_RANGE && Math.abs(e.position.y - me.y) <= 4; // not one in a cave below
       })
       .sort((a, b) => (a === recent ? -1 : b === recent ? 1 : a.position.distanceTo(me) - b.position.distanceTo(me)));
-    // Walled in, nothing can reach us; never break out to chase or run. Checked fresh
-    // (not cached) since the bot may have just sealed itself in.
-    if (threats.length && isSheltered(bot)) return [];
-    return threats;
+    // Walled in, nothing outside can reach us; never break out to chase or run. Only a
+    // mob shut in with us (spawned in a dark room, sealed into a cave) still counts.
+    // Checked fresh, not cached: the bot may have just sealed itself in.
+    const space = threats.length ? enclosure(bot) : null;
+    return space ? threats.filter((e) => space.has(e.position.floored().toString())) : threats;
   }
 
   private fleeReason(threats: Entity[]): { from: Entity; reason: string } | null {
@@ -189,10 +205,11 @@ export class Survival {
     const health = Math.round(bot.health);
     const runFrom = threats.find((e) => RUN_FROM.has(e.name ?? ""));
     if (runFrom) return { from: runFrom, reason: `a ${runFrom.name} got within ${distanceTo(bot, runFrom.position).toFixed(0)}m` };
+    const nearest = threats[0]!;
+    // Badly hurt: never stand and fight (if it keeps up, flee seals the bot in instead).
+    if (health <= LOW_HEALTH) return { from: nearest, reason: `health was down to ${health}/20` };
     // Cornered recently: running didn't work, so fight instead.
     if (Date.now() - this.lastFailedEscape < 15_000) return null;
-    const nearest = threats[0]!;
-    if (health <= LOW_HEALTH) return { from: nearest, reason: `health was down to ${health}/20` };
     // Fists do 1 damage: a bare-handed fight with a zombie costs most of your health.
     if (!bestWeapon(bot)) return { from: nearest, reason: "you have no weapon" };
     const crowd = threats.filter((e) => distanceTo(bot, e.position) <= 8).length;
@@ -203,11 +220,22 @@ export class Survival {
   private async fightBack(target: Entity, signal: AbortSignal): Promise<Outcome> {
     const bot = this.bot;
     log.event(`Reflex: fighting a ${target.name} ${distanceTo(bot, target.position).toFixed(0)}m away (health ${Math.round(bot.health)}/20)`);
-    const cornered = Date.now() - this.lastFailedEscape < 15_000;
-    const result = await this.motor.fight(target, { signal, timeoutMs: 20_000, stopAtHealth: cornered ? undefined : LOW_HEALTH });
+    const result = await this.motor.fight(target, {
+      signal,
+      timeoutMs: 20_000,
+      // Bare-handed, a fight is a slow trade of hits: quit while there's health left to escape on.
+      stopAtHealth: bestWeapon(bot) ? LOW_HEALTH : HURT,
+      // A creeper walking up mid-fight is the bigger danger.
+      stopIf: () => target.name !== "creeper" && this.creeperWithin(5) !== undefined,
+    });
     const health = Math.round(bot.health);
     if (result === "killed") return { kind: "fight", text: `Killed a ${target.name} that came at you. Health ${health}/20.` };
-    if (result === "low_health") return this.flee(target, `health dropped to ${health}/20 fighting a ${target.name}`, signal);
+    if (result === "stopped") return this.flee(this.creeperWithin(8) ?? target, `a creeper came close while fighting a ${target.name}`, signal);
+    if (result === "low_health") {
+      const why = `health dropped to ${health}/20 fighting a ${target.name}`;
+      // It already outran us once: running again just means dying tired.
+      return Date.now() - this.lastFailedEscape < 15_000 ? this.hunker(why, signal) : this.flee(target, why, signal);
+    }
     // Couldn't reach it (up a ledge, down a drop, across water): leave it alone for a while.
     this.ignored.set(target.id, Date.now() + 30_000);
     const why = result === "lost" ? "it got away" : "couldn't reach it";
@@ -217,26 +245,47 @@ export class Survival {
   private async flee(from: Entity, reason: string, signal: AbortSignal): Promise<Outcome> {
     const bot = this.bot;
     log.event(`Reflex: running from a ${from.name} because ${reason}`);
-    const away = new goals.GoalInvert(new goals.GoalFollow(from, 16));
     const started = Date.now();
+    let goalSetAt = 0;
     const deadline = started + 12_000;
-    while (Date.now() < deadline && from.isValid && distanceTo(bot, from.position) < 16) {
-      if (signal.aborted) throw abortError(signal);
-      // It's keeping pace and still biting (a spider outruns a sprinting player), so
-      // running just means being chewed on from behind: turn and fight, even bare-handed.
-      const bitten = this.attacker?.entity.id === from.id && this.attacker.at > started + 1_500;
-      if (bitten && !RUN_FROM.has(from.name ?? "") && distanceTo(bot, from.position) < 4) {
-        bot.pathfinder.setGoal(null);
-        this.lastFailedEscape = Date.now();
-        log.event(`Reflex: the ${from.name} kept up, turning to fight it`);
-        const fought = await this.fightBack(from, signal);
-        return fought && { ...fought, text: `Couldn't outrun a ${from.name} (ran because ${reason}), so turned and fought it. ${fought.text}` };
+    // Walk only, no big drops: fleeing into a ravine or a lava cave is worse than the mob.
+    this.motor.nav.use("flee");
+    try {
+      while (Date.now() < deadline && from.isValid && distanceTo(bot, from.position) < 16) {
+        if (signal.aborted) throw abortError(signal);
+        // It's keeping pace and still biting (a spider outruns a sprinting player), so
+        // running just means being chewed on from behind.
+        const bitten = this.attacker?.entity.id === from.id && this.attacker.at > started + 1_500;
+        if (bitten && !RUN_FROM.has(from.name ?? "") && distanceTo(bot, from.position) < 4) {
+          bot.pathfinder.setGoal(null);
+          this.lastFailedEscape = Date.now();
+          const health = Math.round(bot.health);
+          // Hurt, or it's an enderman (they teleport after you): fighting on is how bots die.
+          if (health <= HURT || from.name === "enderman") {
+            return this.hunker(`Couldn't get away from a ${from.name} (ran because ${reason}; health ${health}/20)`, signal);
+          }
+          // Otherwise turn and fight, even bare-handed.
+          log.event(`Reflex: the ${from.name} kept up, turning to fight it`);
+          const fought = await this.fightBack(from, signal);
+          return fought && { ...fought, text: `Couldn't outrun a ${from.name} (ran because ${reason}), so turned and fought it. ${fought.text}` };
+        }
+        // Run for a fixed spot 20 blocks directly away, re-aimed every 2s. (A goal that
+        // follows the mob replans every tick, and the stuttering bot gets caught.) Also
+        // re-set it if a just-cancelled action cleared it.
+        if (!bot.pathfinder.goal || Date.now() - goalSetAt > 2_000) {
+          const away = bot.entity.position.minus(from.position);
+          away.y = 0;
+          const dir = away.norm() > 0.1 ? away.normalize() : new Vec3(1, 0, 0);
+          const spot = bot.entity.position.plus(dir.scaled(20));
+          bot.pathfinder.setGoal(new goals.GoalXZ(Math.floor(spot.x), Math.floor(spot.z)));
+          goalSetAt = Date.now();
+        }
+        await sleep(250);
       }
-      // Re-assert each round: a just-cancelled action can clear the goal late.
-      if (bot.pathfinder.goal !== away) bot.pathfinder.setGoal(away, true);
-      await sleep(250);
+    } finally {
+      bot.pathfinder.setGoal(null);
+      this.motor.nav.use("normal");
     }
-    bot.pathfinder.setGoal(null);
     const escaped = !from.isValid || distanceTo(bot, from.position) >= 16;
     if (!escaped) this.lastFailedEscape = Date.now();
     const health = Math.round(bot.health);
@@ -246,13 +295,35 @@ export class Survival {
     };
   }
 
+  /** The last resort when it can't win or get away: seal itself in where it stands. */
+  private async hunker(why: string, signal: AbortSignal): Promise<Outcome> {
+    log.event(`Reflex: ${why}; sealing in`);
+    try {
+      const result = await this.shelter(signal);
+      return { kind: "shelter", text: `${capitalize(why)}, so sealed yourself in. ${result} Heal before going back out: eat (health only regenerates at 18+ food).` };
+    } catch (err) {
+      if (err instanceof Interrupted) throw err;
+      const target = this.threats()[0];
+      if (!target) return { kind: "shelter", text: `${capitalize(why)}, and couldn't seal in: ${errorText(err)}` };
+      // Nowhere to hide: fighting back beats being chewed on.
+      log.event(`Reflex: couldn't seal in (${errorText(err)}); fighting the ${target.name}`);
+      const result = await this.motor.fight(target, { signal, timeoutMs: 20_000 });
+      return { kind: "fight", text: `${capitalize(why)}, couldn't seal in (${errorText(err)}), so fought the ${target.name} (${result}). Health ${Math.round(this.bot.health)}/20.` };
+    }
+  }
+
+  private creeperWithin(range: number): Entity | undefined {
+    return Object.values(this.bot.entities).find((e) => e.name === "creeper" && e.isValid && distanceTo(this.bot, e.position) <= range);
+  }
+
   private foodToEat(): string | null {
     const bot = this.bot;
     if (Date.now() - this.lastEatAttempt < 3_000 || bot.food >= 20) return null;
     const hungry = bot.food <= EAT_AT_FOOD || (bot.health <= 14 && bot.food < 18); // health only regenerates at 18+ food
     if (!hungry) return null;
-    // Don't interrupt a task for a snack: wait for a gap, unless starving.
-    if (this.body.owner && bot.food > STARVING) return null;
+    // Don't interrupt a task for a snack: wait for a gap, unless starving or hurt
+    // (hurt and below 18 food, health won't come back until it eats).
+    if (this.body.owner && bot.food > STARVING && !(bot.health <= 10 && bot.food < 18)) return null;
     return foods(bot)[0]?.name ?? null;
   }
 
@@ -288,10 +359,19 @@ export class Survival {
     return this.watery(this.bot.blockAt(this.bot.entity.position.offset(0, 1.62, 0)));
   }
 
+  /**
+   * Whether the server counts the bot as underwater. Sprinting through water puts it in
+   * the swimming pose, with its eyes at body height, so check there too while air drains.
+   */
+  private submerged(): boolean {
+    const bot = this.bot;
+    return this.headUnderwater() || (bot.oxygenLevel < 20 && this.watery(bot.blockAt(bot.entity.position.offset(0, 0.4, 0))));
+  }
+
   /** Swims to the nearest air it can reach through the water, before drowning starts. */
   private async surface(signal: AbortSignal): Promise<Outcome> {
     const bot = this.bot;
-    log.event(`Reflex: running out of air underwater (air ${bot.oxygenLevel}/20), swimming up`);
+    log.event(`Reflex: running out of air underwater (air ${air(bot)}/20), swimming up`);
     const deadline = Date.now() + 15_000;
     try {
       while (this.headUnderwater() && Date.now() < deadline) {
@@ -314,7 +394,7 @@ export class Survival {
     }
     const where = formatPos(bot.entity.position);
     return this.headUnderwater()
-      ? { kind: "air", text: `Ran low on air underwater at ${where} and couldn't find a way up to air. Air ${bot.oxygenLevel}/20; at 0 you start drowning.` }
+      ? { kind: "air", text: `Ran low on air underwater at ${where} and couldn't find a way up to air. Air ${air(bot)}/20; at 0 you start drowning.` }
       : { kind: "air", text: `Ran low on air underwater, so swam to air at ${where}. Keep an eye on air when working underwater.` };
   }
 
@@ -359,7 +439,10 @@ export class Survival {
     const bot = this.bot;
     const { timeOfDay: t, day } = bot.time;
     const sheltered = this.sheltered();
-    if (t >= 13000 && t < 23000 && (sheltered || bot.isSleeping)) this.shelteredTonight = true;
+    if (t >= 13000 && t < 23000) {
+      this.nightSeen = true;
+      if (sheltered || bot.isSleeping) this.shelteredTonight = true;
+    }
 
     // Evening: once a day, from shortly before sunset on through the night.
     if (t >= 11000 && t < 23000 && this.eveningAlertDay !== day) {
@@ -374,15 +457,23 @@ export class Survival {
       }
     }
 
-    if (this.shelteredTonight && (t >= 23000 || t < 1000)) {
-      this.shelteredTonight = false;
-      this.host.alert(`It's morning: the mobs are burning off and it's safe to come out. ${readiness(bot)}`);
-      return;
+    // Morning, whether it came on its own or a command set the time. Wakes an agent that
+    // sheltered for the night or sat idle through it ("I'll go at dawn" needs a dawn).
+    if (this.nightSeen && (t >= 23000 || t < 12000)) {
+      const wasSheltered = this.shelteredTonight;
+      this.nightSeen = this.shelteredTonight = false;
+      if (wasSheltered || this.host.idleMs() > 20_000) {
+        this.host.alert(`It's morning: the mobs are burning off and it's safe to be out. Pick up whatever you put off for the night. ${readiness(bot)}`);
+        return;
+      }
     }
 
-    if (bot.food <= 12 && !foods(bot).length && this.due("hungry", 180_000)) {
+    const hurt = bot.health <= 10 && bot.food < 18;
+    if ((bot.food <= 12 || hurt) && !foods(bot).length && this.due("hungry", 180_000)) {
       this.host.alert(
-        `You're getting hungry (food ${bot.food}/20) and have nothing to eat. At 0 you start losing health. Find food: kill animals (cook the meat if you can) or gather crops.`,
+        hurt
+          ? `Health is ${Math.round(bot.health)}/20 and won't regenerate: that needs food at 18 or more (it's ${bot.food}/20), and you have nothing to eat. Getting food comes first: kill animals (cook the meat if you can) or gather crops, and avoid fights until you've eaten.`
+          : `You're getting hungry (food ${bot.food}/20) and have nothing to eat. At 0 you start losing health. Find food: kill animals (cook the meat if you can) or gather crops.`,
       );
       return;
     }
@@ -410,6 +501,11 @@ export class Survival {
     const where = formatPos(this.bot.entity.position);
     log.event(`Died at ${where}.`);
     this.deathCount++;
+    // A fresh life: no grudges, and no memory of being cornered (a respawned bot that
+    // thinks it's cornered picks bare-handed fights).
+    this.lastFailedEscape = 0;
+    this.attacker = null;
+    this.ignored.clear();
     this.body.interrupt(new Died());
     this.deaths.push({ at: Date.now(), where });
     if (this.deathAlertTimer) return;

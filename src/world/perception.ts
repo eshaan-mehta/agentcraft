@@ -166,6 +166,11 @@ export function shelterBlocks(bot: Bot) {
  * through open blocks from its feet that never reaches open sky and stays small.
  */
 export function isSheltered(bot: Bot, maxCells = 300): boolean {
+  return enclosure(bot, maxCells) !== null;
+}
+
+/** The open cells of the enclosed space the bot is in (as Vec3 strings), or null if it isn't enclosed. */
+export function enclosure(bot: Bot, maxCells = 300): Set<string> | null {
   const start = bot.entity.position.floored();
   const seen = new Set<string>();
   const queue = [start];
@@ -174,18 +179,18 @@ export function isSheltered(bot: Bot, maxCells = 300): boolean {
     const key = cell.toString();
     if (seen.has(key)) continue;
     seen.add(key);
-    if (seen.size > maxCells) return false;
+    if (seen.size > maxCells) return null;
     let roofed = false;
     for (let dy = 1; dy <= 6 && !roofed; dy++) roofed = bot.blockAt(cell.offset(0, dy, 0))?.boundingBox === "block";
-    if (!roofed) return false;
+    if (!roofed) return null;
     for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0]] as const) {
       const next = cell.offset(dx, dy, dz);
       const block = bot.blockAt(next);
-      if (block === null) return false;
+      if (block === null) return null;
       if (block.boundingBox === "empty" && !seen.has(next.toString())) queue.push(next);
     }
   }
-  return true;
+  return seen;
 }
 
 function bedNear(bot: Bot): Block | null {

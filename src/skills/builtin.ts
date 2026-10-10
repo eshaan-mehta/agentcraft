@@ -12,11 +12,13 @@ import type { Memory } from "../world/memory.js";
 import {
   describeSurroundings,
   distanceTo,
+  enclosure,
   exposed,
   findEntities,
   formatPos,
   inventoryCounts,
   inventoryDiff,
+  isHostile,
   isSheltered,
   itemByName,
   normalizeName,
@@ -70,12 +72,18 @@ export async function gather(
     const feetY = bot.entity.position.y;
     const target = bot
       .findBlocks({ matching: ids, maxDistance: radius, count: 256, point: center })
-      .filter((p) => !failed.has(p.toString()))
+      .filter((p) => !failed.has(p.toString()) && liquidBeside(bot, p) !== "lava")
       // Nearest first; prefer blocks with an open face, and ones you can reach without
       // climbing. Buried blocks (stone under dirt) are fine: the path digs down to them.
+      // Avoid underwater ones (drowning) unless there's nothing else.
       .map((p) => ({
         p,
-        score: distanceTo(bot, p) + 3 * Math.max(0, p.y - feetY - 2) + 2 * Math.max(0, feetY - p.y - 3) + (exposed(bot, p) ? 0 : 6),
+        score:
+          distanceTo(bot, p) +
+          3 * Math.max(0, p.y - feetY - 2) +
+          2 * Math.max(0, feetY - p.y - 3) +
+          (exposed(bot, p) ? 0 : 6) +
+          (liquidBeside(bot, p) === "water" ? 24 : 0),
       }))
       .sort((a, b) => a.score - b.score)[0]?.p;
     if (!target) {
@@ -111,6 +119,17 @@ export async function gather(
     throw new ActionError(stopped.startsWith("no more") ? "NOT_FOUND" : "FAILED", `Mined nothing: ${stopped || "every attempt failed"}.${hint}`, result);
   }
   return result;
+}
+
+/** Lava or water touching a block: mining it would let the liquid in on you. */
+function liquidBeside(bot: Bot, p: Vec3): "lava" | "water" | null {
+  let found: "lava" | "water" | null = null;
+  for (const offset of [new Vec3(0, 1, 0), new Vec3(1, 0, 0), new Vec3(-1, 0, 0), new Vec3(0, 0, 1), new Vec3(0, 0, -1)]) {
+    const name = bot.blockAt(p.plus(offset))?.name;
+    if (name === "lava") return "lava";
+    if (name === "water") found = "water";
+  }
+  return found;
 }
 
 /**
@@ -229,9 +248,13 @@ async function centerOn(bot: Bot, cell: Vec3, signal: Signal): Promise<boolean> 
 
 /** Why digging straight down 3 blocks here would be unsafe, or null if it's fine. */
 function digInProblem(bot: Bot, feet: Vec3): string | null {
+  const items = bot.inventory.items();
   for (let depth = 1; depth <= 3; depth++) {
     const block = bot.blockAt(feet.offset(0, -depth, 0));
     if (!block || block.boundingBox !== "block" || !block.diggable) return `${block?.name ?? "an unloaded block"} is in the way`;
+    // Stone and the like take many seconds each by hand: too slow when it matters.
+    const tools = block.harvestTools;
+    if (tools && !items.some((i) => tools[i.type])) return `the ground (${block.name}) is too hard to dig without the right tool`;
   }
   if (bot.blockAt(feet.offset(0, -4, 0))?.boundingBox !== "block") return "there's a gap or cave underneath";
   for (let depth = 1; depth <= 4; depth++) {
@@ -278,22 +301,32 @@ async function waitToLand(bot: Bot, y: number, signal: Signal) {
  */
 export async function buildShelter(ctx: SkillContext, signal: Signal): Promise<string> {
   const { bot, motor } = ctx;
-  if (isSheltered(bot)) return "Already in an enclosed space.";
-  const available = shelterBlocks(bot).reduce((sum, i) => sum + i.count, 0);
-  if (!available) throw new ActionError("MISSING_ITEMS", "No building blocks (dirt, cobblestone, stone, planks). Collect some first; dirt is quickest.");
+  // Enclosed already, unless a mob is shut in too (then dig in, away from it).
+  const space = enclosure(bot);
+  if (space && !Object.values(bot.entities).some((e) => isHostile(e) && space.has(e.position.floored().toString()))) {
+    return "Already in an enclosed space.";
+  }
   bot.pathfinder.setGoal(null);
   const feet = bot.entity.position.floored();
   if (bot.blockAt(feet.offset(0, -1, 0))?.boundingBox !== "block") throw new ActionError("BLOCKED", "Need to be standing on solid ground.");
+  const digProblem = digInProblem(bot, feet);
+  const available = shelterBlocks(bot).reduce((sum, i) => sum + i.count, 0);
+  // Digging in needs one block for the hatch, and digging usually picks up a few.
+  if (!available && digProblem) {
+    throw new ActionError("MISSING_ITEMS", `No building blocks (dirt, cobblestone, stone, planks), and can't dig in here (${digProblem}). Collect some first; dirt is quickest.`);
+  }
   if (!(await centerOn(bot, feet, signal))) throw new ActionError("FAILED", "Couldn't line up in the middle of the block. Try again from flatter ground.");
 
-  const digProblem = digInProblem(bot, feet);
   if (!digProblem) {
     for (let depth = 1; depth <= 3; depth++) {
       await motor.dig(feet.offset(0, -depth, 0), signal, { collect: false });
       await waitToLand(bot, feet.y - depth, signal);
     }
+    for (let i = 0; i < 10 && !shelterBlocks(bot).length; i++) await pause(100, signal); // the dug blocks get picked up
+    const seal = shelterBlocks(bot)[0];
+    if (!seal) throw new ActionError("MISSING_ITEMS", `Dug in 3 deep at ${formatPos(feet)} but have no block to seal the top.`);
     const hatch = feet.offset(0, -1, 0);
-    const placed = await motor.placeInReach(shelterBlocks(bot)[0]!.type, hatch, signal);
+    const placed = await motor.placeInReach(seal.type, hatch, signal);
     return `Dug in and sealed the hole above with ${placed} at ${formatPos(hatch)}. Now at ${formatPos(bot.entity.position)}, safe from mobs.${
       isSheltered(bot) ? "" : " (Warning: the space doesn't look fully enclosed.)"
     } To leave, go_to somewhere or dig the block above.`;

@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { Body } from "../body/body.js";
 import { messageTeammate as sendToTeammate, narrate, say } from "../comms.js";
 import { config, team, type AskMode } from "../config.js";
-import { ActionError, Interrupted, Preempted, errorText } from "../errors.js";
+import { ActionError, Died, Interrupted, Preempted, errorText } from "../errors.js";
 import { log } from "../log.js";
 import type { SkillLibrary } from "../skills/library.js";
 import type { SurvivalHost } from "../survival/reflexes.js";
@@ -439,7 +439,7 @@ export class Agent implements SurvivalHost, Executive {
 
   private async runTools(calls: ToolUse[], signal: AbortSignal): Promise<ToolResult[]> {
     const results: ToolResult[] = [];
-    let preempted = false;
+    let cutOff: Interrupted | null = null; // a reflex took over, or the bot died
     // One body, one action at a time: run calls in order, never in parallel.
     for (const call of calls) {
       log.toolCall(call.name, call.input);
@@ -449,8 +449,9 @@ export class Agent implements SurvivalHost, Executive {
       let isError = true;
       if (signal.aborted) {
         output = "Not run: interrupted by the supervisor.";
-      } else if (preempted) {
-        output = "Not run: your survival reflexes interrupted the call before this one. Check your status and decide again.";
+      } else if (cutOff) {
+        const what = cutOff instanceof Died ? "you died during the call before this one" : "your survival reflexes interrupted the call before this one";
+        output = `Not run: ${what}. Check your status and decide again.`;
       } else if (!tool) {
         output = `Unknown tool "${call.name}".`;
       } else if (!tool.body) {
@@ -470,7 +471,8 @@ export class Agent implements SurvivalHost, Executive {
             if (this.bot.isSleeping && call.name !== "sleep_in_bed") await this.bot.wake().catch(() => {});
             ({ output, isError } = await this.execute(tool, call, lease.signal));
           } finally {
-            preempted = lease.signal.reason instanceof Preempted;
+            const reason: unknown = lease.signal.reason;
+            if (reason instanceof Preempted || reason instanceof Died) cutOff = reason;
             lease.release();
           }
         }

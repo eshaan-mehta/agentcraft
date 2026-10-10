@@ -77,6 +77,12 @@ export class Body {
     }
   }
 
+  /** Cancels whatever holds the body, with `reason` as the error it sees, and stops moving. */
+  interrupt(reason: Interrupted) {
+    this.holder?.controller.abort(reason);
+    this.halt();
+  }
+
   /**
    * Stops movement and any action in progress. Uses setGoal(null), never
    * pathfinder.stop(): stop() sets a flag that, when nothing is moving, cancels the

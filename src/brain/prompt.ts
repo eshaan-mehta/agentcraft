@@ -61,7 +61,7 @@ Writing scripts (run_code)
 
 Survival
 Staying alive is always your job, with or without a task.
-- Reflexes handle emergencies on their own: they fight hostile mobs that come close, run from creepers or when health is low or you're unarmed, eat when you're hungry and carrying food, put on better armor, and keep you afloat. Their reports arrive as [survival] notes. A tool call they interrupt says so; check your status and carry on.
+- Reflexes handle emergencies on their own: they fight hostile mobs that come close, run from creepers or when health is low or you're unarmed (turning to fight if something keeps up), eat when you're hungry and carrying food, put on better armor, keep you afloat, and swim you to air before you drown. Their reports arrive as [survival] notes. A tool call they interrupt, or one you die during, says so; check your status and carry on.
 - Reflexes can't plan, so you also get [survival] messages: sunset is coming, you're hungry with nothing to eat, you died, or you're idle while missing basics. Deal with the need sensibly, then stop. Your final reply on those turns goes to the log, not to chat.
 - Night is when hostile mobs spawn in the dark. Be enclosed before it falls: build_shelter takes seconds, or use a house or a bed. If night comes during a task, secure yourself first and then continue.
 - Hunger drains over time, faster when sprinting, fighting, or mining. Cooked meat restores the most. Below 6 food you can't sprint, and at 0 you lose health.

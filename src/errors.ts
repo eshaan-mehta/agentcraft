@@ -37,6 +37,14 @@ export class Preempted extends Interrupted {
   }
 }
 
+/** The bot died while the action was running. */
+export class Died extends Interrupted {
+  readonly code = "DIED";
+  constructor() {
+    super("You died while doing this. See the [survival] note for what happened.");
+  }
+}
+
 /** The error to throw for an aborted signal: whatever it was aborted with, or a plain interrupt. */
 export function abortError(signal: AbortSignal): Interrupted {
   return signal.reason instanceof Interrupted ? signal.reason : new Interrupted();

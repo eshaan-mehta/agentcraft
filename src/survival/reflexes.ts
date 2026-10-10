@@ -1,19 +1,21 @@
 // Keeps the bot alive no matter what Claude is doing. Reflexes (fight, flee, eat,
-// wear armor, stay afloat) run in code every half second and take the body from
-// whatever task holds it. Needs that take planning (night is coming, no food, just
-// died, idle without basics) are raised with Claude as [survival] messages.
+// wear armor, stay afloat, come up for air) run in code every half second and take
+// the body from whatever task holds it. Needs that take planning (night is coming,
+// no food, just died, idle without basics) are raised with Claude as [survival] messages.
 import type { Bot } from "mineflayer";
 import pathfinderPkg from "mineflayer-pathfinder";
 import { setTimeout as sleep } from "node:timers/promises";
+import { Vec3 } from "vec3";
 import type { Body } from "../body/body.js";
 import type { Motor } from "../body/motor.js";
 import { config } from "../config.js";
-import { errorText } from "../errors.js";
+import { Died, abortError, errorText } from "../errors.js";
 import { log } from "../log.js";
 import { bestWeapon, distanceTo, equipment, foods, formatPos, isHostile, isSheltered, readiness, shelterBlocks } from "../world/perception.js";
 
 const { goals } = pathfinderPkg;
 type Entity = Bot["entity"];
+type Block = NonNullable<ReturnType<Bot["blockAt"]>>;
 type Outcome = { kind: string; text: string } | null;
 
 /** What the survival layer needs from the agent. */
@@ -35,6 +37,10 @@ const RUN_FROM_RANGE = 12; // creepers: start running well before the 3-block fu
 const LOW_HEALTH = 6; // 3 hearts: stop fighting and run
 const EAT_AT_FOOD = 14;
 const STARVING = 6; // at or below this, eat even if it interrupts a task
+const LOW_AIR = 12; // of 20: about 9 seconds left before drowning starts
+const WATERY = new Set(["water", "bubble_column", "kelp", "kelp_plant", "seagrass", "tall_seagrass"]);
+// Up first, so that among equally short swims the route goes straight up.
+const SWIM_STEPS = [[0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, -1, 0]].map(([x, y, z]) => new Vec3(x!, y!, z!));
 
 const ARMOR_TIERS = ["leather", "golden", "copper", "chainmail", "iron", "diamond", "netherite"];
 const ARMOR = [
@@ -66,6 +72,7 @@ export class Survival {
   private eveningAlertDay = -1;
   private shelteredTonight = false;
   private deaths: { at: number; where: string }[] = [];
+  private deathCount = 0;
   private deathAlertTimer: NodeJS.Timeout | null = null;
   private lastDeathAlert = 0;
   private aboutMe: { text: string; at: number }[] = [];
@@ -98,13 +105,14 @@ export class Survival {
     const bot = this.bot;
     if (this.busy || !bot.entity || bot.health <= 0) return;
     this.stayAfloat();
+    if (bot.oxygenLevel <= LOW_AIR && this.headUnderwater()) return this.takeOver("air", (signal) => this.surface(signal));
 
     const threats = this.threats();
     if (threats.length) {
       const flee = this.fleeReason(threats);
       // If a task is already fighting, let it, unless it's time to run.
       if (!flee && this.body.owner?.startsWith("task:") && /attack|fight|hunt/.test(this.body.owner)) return;
-      return this.takeOver(flee ? "flee" : "fight", () => (flee ? this.flee(flee.from, flee.reason) : this.fightBack(threats[0]!)));
+      return this.takeOver(flee ? "flee" : "fight", (signal) => (flee ? this.flee(flee.from, flee.reason, signal) : this.fightBack(threats[0]!, signal)));
     }
 
     const food = this.foodToEat();
@@ -132,19 +140,21 @@ export class Survival {
   }
 
   /** Runs a reflex with the body, taking it from (and interrupting) any task that holds it. */
-  private takeOver(name: string, run: () => Promise<Outcome>) {
+  private takeOver(name: string, run: (signal: AbortSignal) => Promise<Outcome>) {
     this.busy = true;
+    const deaths = this.deathCount;
     void (async () => {
       try {
-        const outcome = await this.body.with(`reflex:${name}`, "reflex", undefined, () => run());
-        if (outcome) {
+        const outcome = await this.body.with(`reflex:${name}`, "reflex", undefined, run);
+        // If it died partway, the outcome ("ran", "killed it") is wrong; the death alert covers it.
+        if (outcome && this.deathCount === deaths) {
           log.event(`Reflex: ${outcome.text}`);
           // A run of the same thing (several fights, several bites) is reported once.
           if (Date.now() - (this.lastReport.get(outcome.kind) ?? 0) > 15_000) this.host.report(outcome.text);
           this.lastReport.set(outcome.kind, Date.now());
         }
       } catch (err) {
-        log.error(`Survival reflex failed: ${errorText(err)}`, err);
+        if (!(err instanceof Died)) log.error(`Survival reflex failed: ${errorText(err)}`, err);
       } finally {
         this.busy = false;
       }
@@ -190,26 +200,38 @@ export class Survival {
     return null;
   }
 
-  private async fightBack(target: Entity): Promise<Outcome> {
+  private async fightBack(target: Entity, signal: AbortSignal): Promise<Outcome> {
     const bot = this.bot;
     log.event(`Reflex: fighting a ${target.name} ${distanceTo(bot, target.position).toFixed(0)}m away (health ${Math.round(bot.health)}/20)`);
     const cornered = Date.now() - this.lastFailedEscape < 15_000;
-    const result = await this.motor.fight(target, { timeoutMs: 20_000, stopAtHealth: cornered ? undefined : LOW_HEALTH });
+    const result = await this.motor.fight(target, { signal, timeoutMs: 20_000, stopAtHealth: cornered ? undefined : LOW_HEALTH });
     const health = Math.round(bot.health);
     if (result === "killed") return { kind: "fight", text: `Killed a ${target.name} that came at you. Health ${health}/20.` };
-    if (result === "low_health") return this.flee(target, `health dropped to ${health}/20 fighting a ${target.name}`);
+    if (result === "low_health") return this.flee(target, `health dropped to ${health}/20 fighting a ${target.name}`, signal);
     // Couldn't reach it (up a ledge, down a drop, across water): leave it alone for a while.
     this.ignored.set(target.id, Date.now() + 30_000);
     const why = result === "lost" ? "it got away" : "couldn't reach it";
     return { kind: "fight", text: `Went after a ${target.name} but ${why}; it's at ${formatPos(target.position)}. Health ${health}/20.` };
   }
 
-  private async flee(from: Entity, reason: string): Promise<Outcome> {
+  private async flee(from: Entity, reason: string, signal: AbortSignal): Promise<Outcome> {
     const bot = this.bot;
     log.event(`Reflex: running from a ${from.name} because ${reason}`);
     const away = new goals.GoalInvert(new goals.GoalFollow(from, 16));
-    const deadline = Date.now() + 12_000;
+    const started = Date.now();
+    const deadline = started + 12_000;
     while (Date.now() < deadline && from.isValid && distanceTo(bot, from.position) < 16) {
+      if (signal.aborted) throw abortError(signal);
+      // It's keeping pace and still biting (a spider outruns a sprinting player), so
+      // running just means being chewed on from behind: turn and fight, even bare-handed.
+      const bitten = this.attacker?.entity.id === from.id && this.attacker.at > started + 1_500;
+      if (bitten && !RUN_FROM.has(from.name ?? "") && distanceTo(bot, from.position) < 4) {
+        bot.pathfinder.setGoal(null);
+        this.lastFailedEscape = Date.now();
+        log.event(`Reflex: the ${from.name} kept up, turning to fight it`);
+        const fought = await this.fightBack(from, signal);
+        return fought && { ...fought, text: `Couldn't outrun a ${from.name} (ran because ${reason}), so turned and fought it. ${fought.text}` };
+      }
       // Re-assert each round: a just-cancelled action can clear the goal late.
       if (bot.pathfinder.goal !== away) bot.pathfinder.setGoal(away, true);
       await sleep(250);
@@ -251,12 +273,79 @@ export class Survival {
   /** Holds the jump key while underwater and idle, so the bot doesn't sink and drown. */
   private stayAfloat() {
     const bot = this.bot;
-    const eyes = bot.blockAt(bot.entity.position.offset(0, 1.62, 0));
-    const swim = eyes?.name === "water" && !bot.pathfinder.isMoving();
+    const swim = this.headUnderwater() && !bot.pathfinder.isMoving();
     if (swim !== this.swimming) {
       bot.setControlState("jump", swim);
       this.swimming = swim;
     }
+  }
+
+  private watery(block: Block | null): boolean {
+    return Boolean(block && (WATERY.has(block.name) || block.getProperties().waterlogged === true));
+  }
+
+  private headUnderwater(): boolean {
+    return this.watery(this.bot.blockAt(this.bot.entity.position.offset(0, 1.62, 0)));
+  }
+
+  /** Swims to the nearest air it can reach through the water, before drowning starts. */
+  private async surface(signal: AbortSignal): Promise<Outcome> {
+    const bot = this.bot;
+    log.event(`Reflex: running out of air underwater (air ${bot.oxygenLevel}/20), swimming up`);
+    const deadline = Date.now() + 15_000;
+    try {
+      while (this.headUnderwater() && Date.now() < deadline) {
+        if (signal.aborted) throw abortError(signal);
+        const head = bot.entity.position.offset(0, 1.62, 0);
+        // Steer for the first waypoint more than a block away: up when it's level or
+        // above, forward when it's off to the side.
+        const next = this.swimRoute()?.find((p) => p.offset(0.5, 0.5, 0.5).distanceTo(head) > 1.2);
+        bot.setControlState("jump", !next || next.y + 0.5 >= head.y - 0.3);
+        if (next) {
+          const flat = Math.hypot(next.x + 0.5 - bot.entity.position.x, next.z + 0.5 - bot.entity.position.z);
+          await bot.lookAt(next.offset(0.5, 0.5, 0.5), true);
+          bot.setControlState("forward", flat > 0.4);
+        }
+        await sleep(200);
+      }
+    } finally {
+      bot.clearControlStates();
+      this.swimming = false;
+    }
+    const where = formatPos(bot.entity.position);
+    return this.headUnderwater()
+      ? { kind: "air", text: `Ran low on air underwater at ${where} and couldn't find a way up to air. Air ${bot.oxygenLevel}/20; at 0 you start drowning.` }
+      : { kind: "air", text: `Ran low on air underwater, so swam to air at ${where}. Keep an eye on air when working underwater.` };
+  }
+
+  /**
+   * The shortest swim from head height to air, through water only (so never toward
+   * air behind a wall): the head positions along the way, ending in the air block.
+   */
+  private swimRoute(): Vec3[] | null {
+    const bot = this.bot;
+    const start = bot.entity.position.offset(0, 1.62, 0).floored();
+    const key = (p: Vec3) => `${p.x},${p.y},${p.z}`;
+    const cameFrom = new Map<string, Vec3 | null>([[key(start), null]]);
+    const queue = [start];
+    while (queue.length && cameFrom.size < 3_000) {
+      const p = queue.shift()!;
+      for (const step of SWIM_STEPS) {
+        const q = p.plus(step);
+        if (cameFrom.has(key(q))) continue;
+        cameFrom.set(key(q), p);
+        const block = bot.blockAt(q);
+        if (block?.name === "air" || block?.name === "cave_air") {
+          const route = [q];
+          for (let at: Vec3 | null | undefined = p; at; at = cameFrom.get(key(at))) route.unshift(at);
+          return route;
+        }
+        // Sideways, the body (a block below the head) has to fit through too.
+        const fits = step.y !== 0 || this.watery(bot.blockAt(q.offset(0, -1, 0)));
+        if (this.watery(block) && fits && q.distanceTo(start) <= 16) queue.push(q);
+      }
+    }
+    return null;
   }
 
   private sheltered(): boolean {
@@ -320,7 +409,8 @@ export class Survival {
   private onDeath() {
     const where = formatPos(this.bot.entity.position);
     log.event(`Died at ${where}.`);
-    this.body.halt();
+    this.deathCount++;
+    this.body.interrupt(new Died());
     this.deaths.push({ at: Date.now(), where });
     if (this.deathAlertTimer) return;
     // Wait for the respawn, and fold rapid repeat deaths into one message.

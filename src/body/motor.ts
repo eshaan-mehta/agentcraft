@@ -96,6 +96,16 @@ const FUELS: [RegExp, number][] = [
 
 const KEEP_ON_DEPOSIT = /_(pickaxe|axe|shovel|hoe|sword|helmet|chestplate|leggings|boots)$|^(shield|bow|crossbow|trident|arrow|torch)$/;
 
+/** Milliseconds between full-strength swings with what's in hand. */
+function swingCooldown(item: string | undefined): number {
+  if (item?.endsWith("_sword")) return 625;
+  if (item?.endsWith("_pickaxe")) return 850;
+  if (item?.endsWith("_shovel")) return 1_000;
+  if (item?.endsWith("_axe")) return 1_100;
+  if (item === "trident") return 910;
+  return 300; // fists, blocks, and anything else swing 4 times a second
+}
+
 export type FightResult = "killed" | "timeout" | "unreachable" | "lost" | "low_health";
 export type Slot = "hand" | "off-hand" | "head" | "torso" | "legs" | "feet";
 
@@ -417,8 +427,10 @@ export class Motor {
           await bot.lookAt(target.position.offset(0, target.height * 0.85, 0), true);
           bot.attack(target);
         }
-        await sleep(625); // roughly a full attack cooldown
+        await sleep(swingCooldown(bot.heldItem?.name));
       }
+      // The target also vanishes when *we* die and respawn; that isn't a kill.
+      if (options.signal?.aborted) throw abortError(options.signal);
       return "killed";
     } finally {
       bot.pathfinder.setGoal(null);

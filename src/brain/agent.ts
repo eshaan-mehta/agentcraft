@@ -28,7 +28,10 @@ const FALLBACK_MODELS = new Set(["claude-opus-5-5", "claude-opus-5", "claude-fab
 const PRICING: Record<string, [number, number, number, number]> = {
   "claude-sonnet-5-5": [2, 10, 0.2, 2.5],
   "claude-opus-5-5": [4, 20, 0.2, 5],
+  "claude-haiku-5-5": [0.1, 0.5, 0.01, 0.125],
 };
+// Models whose rates go up 5x on requests with a prompt over this many tokens.
+const LONG_PROMPT: Record<string, number> = { "claude-haiku-5-5": 100_000 };
 
 interface Pending {
   text: string;
@@ -559,7 +562,8 @@ export class Agent implements SurvivalHost, Executive {
     const cacheWrite = u.cache_creation_input_tokens ?? 0;
     const output = u.output_tokens;
     const price = PRICING[config.claude.model];
-    const cost = price ? (input * price[0] + output * price[1] + cacheRead * price[2] + cacheWrite * price[3]) / 1e6 : 0;
+    const tier = input + cacheRead + cacheWrite > (LONG_PROMPT[config.claude.model] ?? Infinity) ? 5 : 1;
+    const cost = price ? (tier * (input * price[0] + output * price[1] + cacheRead * price[2] + cacheWrite * price[3])) / 1e6 : 0;
     const t = this.totals;
     t.requests++;
     t.input += input;

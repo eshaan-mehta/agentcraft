@@ -7,6 +7,8 @@
 // their own (data/agents/<name>/). Each agent has its own conversation and logs.
 // Type "@name message", "@team message", or "@all message" to talk to some of them;
 // a message with no @ goes to all of them.
+// An agent that crashes or loses its connection is restarted and resumes its
+// conversation, up to 3 times in 5 minutes.
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -76,6 +78,9 @@ interface Running {
   label: string;
 }
 const running: Running[] = [];
+let stopping = false;
+let restarting = 0;
+const crashes = new Map<string, number[]>(); // name -> recent crash times
 
 function start(spec: AgentSpec, color: (typeof COLORS)[number]) {
   const own = path.join(dataDir, "agents", spec.name);
@@ -98,10 +103,25 @@ function start(spec: AgentSpec, color: (typeof COLORS)[number]) {
   for (const stream of [child.stdout, child.stderr]) {
     readline.createInterface({ input: stream! }).on("line", (line) => console.log(`${label} ${line}`));
   }
+  child.stdin?.on("error", () => {}); // a line sent just as it exited
   child.on("exit", (code) => {
-    console.log(`${label} exited${code ? ` with code ${code}` : ""}.`);
     running.splice(running.indexOf(entry), 1);
-    if (!running.length) process.exit(0);
+    // A crash or a lost connection: bring it back (its conversation resumes), unless
+    // it keeps crashing.
+    const recent = (crashes.get(spec.name) ?? []).filter((t) => Date.now() - t < 5 * 60_000);
+    if (code && !stopping && recent.length < 3) {
+      crashes.set(spec.name, [...recent, Date.now()]);
+      console.log(`${label} exited with code ${code}; restarting it in 5s.`);
+      restarting++;
+      setTimeout(() => {
+        restarting--;
+        if (!stopping) start(spec, color);
+        else if (!running.length) process.exit(0);
+      }, 5_000);
+      return;
+    }
+    console.log(`${label} exited${code ? ` with code ${code}${recent.length >= 3 ? " (crashed 3 times in 5 minutes; not restarting)" : ""}` : ""}.`);
+    if (!running.length && !restarting) process.exit(0);
   });
 }
 
@@ -131,11 +151,15 @@ terminal.on("line", (input) => {
   }
   // Forward the line with its address, so each agent knows who else got it.
   for (const r of recipients) r.child.stdin?.write(`${line}\n`);
-  if (!target && text === "/quit") setTimeout(() => process.exit(0), 5_000);
+  if (!target && text === "/quit") {
+    stopping = true;
+    setTimeout(() => process.exit(0), 5_000);
+  }
 });
 
 // Ctrl+C reaches the agents too (same terminal); each has already saved its conversation.
 process.on("SIGINT", () => {
+  stopping = true;
   console.log("Stopping agents...");
   setTimeout(() => process.exit(0), 5_000);
 });

@@ -24,6 +24,9 @@ const PROPERTIES = {
   "server-port": String(config.mc.port),
   "spawn-protection": "0",
   "allow-flight": "true",
+  // No watchdog: a tick that stalls (say, the disk freezing for a minute during a save)
+  // means some lag instead of the server killing itself.
+  "max-tick-time": "-1",
   motd: "Claude agent test world",
 };
 

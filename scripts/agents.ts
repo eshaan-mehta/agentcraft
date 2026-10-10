@@ -55,8 +55,19 @@ function loadSpecs(args: string[]): AgentSpec[] {
   return Array.isArray(parsed) ? parsed : (parsed.agents ?? []);
 }
 
+const dataDir = process.env.DATA_DIR ?? "data";
 const specs = loadSpecs(process.argv.slice(2));
 if (!specs.length) fail("No agents to start.");
+// Minecraft names are case-sensitive ("ace" is a different player from "Ace", with
+// its own inventory and position), so match the spelling of an agent that already exists.
+const known = fs.existsSync(path.join(dataDir, "agents")) ? fs.readdirSync(path.join(dataDir, "agents")) : [];
+for (const spec of specs) {
+  const existing = known.find((name) => name !== spec.name && name.toLowerCase() === spec.name.toLowerCase());
+  if (existing) {
+    console.log(`Using "${existing}" for "${spec.name}", matching the existing agent's spelling.`);
+    spec.name = existing;
+  }
+}
 const names = new Set<string>();
 for (const spec of specs) {
   if (!NAME.test(spec.name)) fail(`"${spec.name}" isn't a valid Minecraft name (3-16 letters, digits, or _).`);
@@ -68,7 +79,6 @@ for (const spec of specs) {
   if (spec.team && names.has(spec.team.toLowerCase())) fail(`Team "${spec.team}" has the same name as an agent; pick a different team name.`);
 }
 
-const dataDir = process.env.DATA_DIR ?? "data";
 const logDir = process.env.LOG_DIR ?? "logs";
 const roster = specs.map((s) => (s.team ? `${s.name}:${s.team}` : s.name)).join(",");
 
